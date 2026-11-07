@@ -62,6 +62,8 @@ void EmitIsbeRead(EmitContext& ctx);
 void EmitIsbeWriteAttribute(EmitContext& ctx);
 void EmitIsbeWriteMapU8(EmitContext& ctx);
 void EmitIsbeWriteMapU32(EmitContext& ctx);
+void EmitTensorMulAdd(EmitContext& ctx, IR::Inst& inst, const IR::Value& a, const IR::Value& b,
+                      const IR::Value& c);
 void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, ScalarF32 value);
 void EmitSetSampleMask(EmitContext& ctx, ScalarS32 value);
 void EmitSetFragDepth(EmitContext& ctx, ScalarF32 value);
@@ -245,6 +247,7 @@ void EmitFPNeg64(EmitContext& ctx, IR::Inst& inst, Register value);
 void EmitFPSin(EmitContext& ctx, IR::Inst& inst, ScalarF32 value);
 void EmitFPCos(EmitContext& ctx, IR::Inst& inst, ScalarF32 value);
 void EmitFPExp2(EmitContext& ctx, IR::Inst& inst, ScalarF32 value);
+void EmitFPTanh(EmitContext& ctx, IR::Inst& inst, ScalarF32 value);
 void EmitFPLog2(EmitContext& ctx, IR::Inst& inst, ScalarF32 value);
 void EmitFPRecip32(EmitContext& ctx, IR::Inst& inst, ScalarF32 value);
 void EmitFPRecip64(EmitContext& ctx, Register value);

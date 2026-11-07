@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <unordered_set>
 #include <fmt/ranges.h>
@@ -24,6 +25,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
@@ -36,6 +38,17 @@ void ShaderCache::InvalidateRegion(VAddr addr, size_t size) {
     RemovePendingShaders();
 }
 
+void ShaderCache::InvalidateRegions(std::span<const std::pair<DAddr, size_t>> sequences) {
+    if (sequences.empty()) {
+        return;
+    }
+    std::scoped_lock lock{invalidation_mutex};
+    for (const auto& [addr, size] : sequences) {
+        InvalidatePagesInRegion(addr, size);
+    }
+    RemovePendingShaders();
+}
+
 void ShaderCache::OnCacheInvalidation(VAddr addr, size_t size) {
     std::scoped_lock lock{invalidation_mutex};
     InvalidatePagesInRegion(addr, size);
@@ -44,6 +57,58 @@ void ShaderCache::OnCacheInvalidation(VAddr addr, size_t size) {
 void ShaderCache::SyncGuestHost() {
     std::scoped_lock lock{invalidation_mutex};
     RemovePendingShaders();
+}
+
+void ShaderCache::RefreshDebugRejections(bool unrejected) {
+    std::vector<std::pair<VAddr, VAddr>> ranges;
+    {
+        std::scoped_lock lock{lookup_mutex};
+        for (const auto& [addr, entry] : lookup_cache) {
+            const ShaderInfo* const info = entry->data;
+            if (info->lowered_native &&
+                (VideoCore::Nx2Debug::IsRejected(info->unique_hash) ||
+                 VideoCore::Nx2Debug::IsRejected(info->lowered_native->native_program_key))) {
+                ranges.emplace_back(entry->addr_start, entry->addr_end);
+            }
+        }
+    }
+    {
+        std::scoped_lock lock{invalidation_mutex};
+        for (const auto& [start, end] : ranges) {
+            InvalidatePagesInRegion(start, end - start);
+        }
+        RemovePendingShaders();
+    }
+    if (unrejected) {
+        std::scoped_lock lock{rejected_mutex};
+        rejected_native.clear();
+    }
+    // shader_infos may point at removed programs: every channel must refresh its stages.
+    for (const size_t id : active_channel_ids) {
+        channel_storage[id].maxwell3d.dirty.flags[VideoCommon::Dirty::Shaders] = true;
+    }
+    LOG_INFO(HW_GPU, "Debug server rejections applied: {} cached programs dropped{}", ranges.size(),
+             unrejected ? ", earlier rejections forgotten" : "");
+}
+
+std::array<u64, 6> ShaderCache::GraphicsNativeKeys(
+    const std::array<u64, NUM_PROGRAMS>& unique_hashes) const {
+    std::array<u64, NUM_PROGRAMS> keys{};
+    for (size_t index = 0; index < NUM_PROGRAMS; ++index) {
+        const ShaderInfo* const info = shader_infos[index];
+        if (unique_hashes[index] != 0 && info && info->lowered_native) {
+            keys[index] = info->lowered_native->native_program_key;
+        }
+    }
+    return keys;
+}
+
+u64 ShaderCache::ComputeNativeKey() {
+    const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
+    const GPUVAddr shader_addr{program_base + kepler_compute->launch_description.program_start};
+    const std::optional<VAddr> cpu_shader_addr{gpu_memory->GpuToCpuAddress(shader_addr)};
+    const ShaderInfo* const info{cpu_shader_addr ? TryGet(*cpu_shader_addr) : nullptr};
+    return info && info->lowered_native ? info->lowered_native->native_program_key : 0;
 }
 
 ShaderCache::ShaderCache(Tegra::MaxwellDeviceMemoryManager& device_memory_)
@@ -304,10 +369,17 @@ void ShaderCache::RemovePendingShaders() {
     marked_for_removal.clear();
 
     if (!removed_shaders.empty()) {
-        // Remove the given shaders from the cache
-        std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {
-            return std::ranges::find(removed_shaders, shader.get()) != removed_shaders.end();
-        });
+        if (removed_shaders.size() > 16) {
+            std::ranges::sort(removed_shaders, std::less<ShaderInfo*>{});
+            std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {
+                return std::binary_search(removed_shaders.begin(), removed_shaders.end(),
+                                          shader.get(), std::less<ShaderInfo*>{});
+            });
+        } else {
+            std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {
+                return std::ranges::find(removed_shaders, shader.get()) != removed_shaders.end();
+            });
+        }
     }
 }
 

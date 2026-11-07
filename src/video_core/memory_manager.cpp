@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -152,6 +154,7 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
     }
     flush_modified();
     kind_map.Map(gpu_addr, gpu_addr + size, kind);
+    map_serial.fetch_add(1, std::memory_order_release);
     return gpu_addr;
 }
 
@@ -207,6 +210,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
         std::unique_lock<std::mutex> lock(guard);
         kind_map.Map(gpu_addr, gpu_addr + size, kind);
     }
+    map_serial.fetch_add(1, std::memory_order_release);
     return gpu_addr;
 }
 
@@ -467,6 +471,18 @@ void MemoryManager::ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, co
     ReadBlockImpl(gpu_src_addr, dest_buffer, size, VideoCommon::CacheType::None, true);
 }
 
+void MemoryManager::ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_t count) const {
+    const std::size_t size = count * sizeof(u32);
+    const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
+    if (shim && gpu_src_addr < shim + NumShimSyncpoints * sizeof(u32) && gpu_src_addr + size > shim) {
+        for (std::size_t i = 0; i < count; ++i) {
+            dest[i] = Read<u32>(gpu_src_addr + i * sizeof(u32));
+        }
+        return;
+    }
+    ReadBlockUnsafe(gpu_src_addr, dest, size);
+}
+
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) {
     // Give Switch 2 sparse pages the write lands on their memory first (otherwise it is dropped).
     Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
@@ -475,25 +491,26 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     };
     auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
         const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
-        if (!unsafe) {
-            rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
-        }
         if (u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
             std::memcpy(physical, src_buffer, copy_amount);
+        }
+        // After the copy: the buffer cache may upload the written bytes from guest memory.
+        if (!unsafe) {
+            rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
         }
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
         const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
-        if (!unsafe) {
-            rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
-        }
         u8* const physical = IsBigPageContinuous(page_index) ? memory.GetPointer<u8>(dev_addr_base)
                                                              : nullptr;
         if (physical != nullptr) [[likely]] {
             std::memcpy(physical, src_buffer, copy_amount);
         } else {
             memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
+        }
+        if (!unsafe) {
+            rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
         }
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
@@ -568,6 +585,30 @@ bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
 }
 
 size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
+    // Native storage buffers ask this for up to 8 MiB on each bind, ~70,000 times a second in
+    // title 1's forest (17% of the GPU thread walking pages): keep answers per thread until the
+    // page table changes. Ocarina of Time asks ~220,000 times a second for more buffers than 64
+    // entries hold: a ninth missed and walked ~7 MiB each, 44% of the GPU thread.
+    struct Entry {
+        size_t owner;
+        GPUVAddr gpu_addr;
+        size_t size;
+        u64 serial;
+        size_t result;
+    };
+    thread_local std::vector<Entry> cache(4096);
+    const u64 serial = map_serial.load(std::memory_order_acquire);
+    Entry& entry = cache[((gpu_addr ^ size) * 0x9E3779B97F4A7C15ULL) >> 52];
+    if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr && entry.size == size &&
+        entry.serial == serial) {
+        return entry.result;
+    }
+    const size_t result = MaxContinuousRangeUncached(gpu_addr, size);
+    entry = {unique_identifier + 1, gpu_addr, size, serial, result};
+    return result;
+}
+
+size_t MemoryManager::MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const {
     std::optional<DAddr> old_page_addr{};
     size_t range_so_far = 0;
     bool result{false};

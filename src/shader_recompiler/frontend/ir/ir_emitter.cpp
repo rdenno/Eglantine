@@ -571,6 +571,16 @@ F16F32F64 IREmitter::FPAdd(const F16F32F64& a, const F16F32F64& b, FpControl con
     }
 }
 
+Value IREmitter::TensorMulAdd(const Value& a, const Value& b, const Value& c, u32 depth) {
+    if (a.Type() != Type::U32x4 || b.Type() != Type::U32x2 || c.Type() != Type::U32x2 ||
+        (depth != 8 && depth != 16)) {
+        throw InvalidArgument("Invalid software matrix operands");
+    }
+    const Value result = Inst(Opcode::TensorMulAdd, a, b, c);
+    result.Inst()->SetFlags<u32>(depth);
+    return result;
+}
+
 Value IREmitter::CompositeConstruct(const Value& e1, const Value& e2) {
     if (e1.Type() != e2.Type()) {
         throw InvalidArgument("Mismatching types {} and {}", e1.Type(), e2.Type());
@@ -867,6 +877,10 @@ F32 IREmitter::FPSin(const F32& value) {
 
 F32 IREmitter::FPExp2(const F32& value) {
     return Inst<F32>(Opcode::FPExp2, value);
+}
+
+F32 IREmitter::FPTanh(const F32& value) {
+    return Inst<F32>(Opcode::FPTanh, value);
 }
 
 F32 IREmitter::FPLog2(const F32& value) {

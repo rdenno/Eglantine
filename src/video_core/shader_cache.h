@@ -67,6 +67,8 @@ public:
     /// @param size Number of bytes of the invalidation
     void InvalidateRegion(VAddr addr, size_t size);
 
+    void InvalidateRegions(std::span<const std::pair<DAddr, size_t>> sequences);
+
     /// @brief Unmarks a memory region as cached and marks it for removal
     /// @param addr Start address of the CPU write operation
     /// @param size Number of bytes of the CPU write operation
@@ -74,6 +76,18 @@ public:
 
     /// @brief Flushes delayed removal operations
     void SyncGuestHost();
+
+    /// Drops the cached native programs the debug server rejects (docs/nx2/debug-mcp.md); after
+    /// an un-reject also every remembered rejection. Rasterizer thread, between frames.
+    void RefreshDebugRejections(bool unrejected);
+
+    /// Native program keys of the graphics stages bound by the last RefreshStages (0 where a
+    /// stage is off or not a native program), for the frame dump.
+    [[nodiscard]] std::array<u64, NUM_PROGRAMS> GraphicsNativeKeys(
+        const std::array<u64, NUM_PROGRAMS>& unique_hashes) const;
+
+    /// Native program key of the bound compute program, 0 when unknown, for the frame dump.
+    [[nodiscard]] u64 ComputeNativeKey();
 
 protected:
     struct GraphicsEnvironments {
@@ -104,6 +118,8 @@ protected:
     bool last_shaders_valid = false;
 
 private:
+    friend struct ShaderCacheTestAccess;
+
     /// @brief Tries to obtain a cached shader starting in a given address
     /// @note Doesn't check for ranges, the given address has to be the start of the shader
     /// @param addr Start address of the shader, this doesn't cache for region

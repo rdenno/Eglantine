@@ -31,6 +31,7 @@
 #include <fmt/ostream.h>
 
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/string_util.h"
@@ -58,7 +59,6 @@
 #endif
 #include "yuzu_cmd/emu_window/emu_window_sdl3_null.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3_vk.h"
-#include "yuzu_cmd/nx2_sampler.h"
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/resource.h>
@@ -249,9 +249,12 @@ struct SdlState {
     // Must outlive emu_window, which keeps a pointer to it.
     InputCommon::InputSubsystem input_subsystem{};
     std::unique_ptr<EmuWindow_SDL3> emu_window;
+    bool network_initialized{};
 };
 
 static std::atomic_bool pack_nup_cancel{false};
+static std::atomic_bool unpack_nup_cancel{false};
+static std::atomic_bool edit_nup_cancel{false};
 
 // eden-cli --pack-nup <dump> [<out.nup>]; the output defaults to <dump>.nup next to the dump.
 static bool PackNup(const std::string& source, const std::string& output) {
@@ -290,6 +293,102 @@ static bool PackNup(const std::string& source, const std::string& output) {
         return false;
     default:
         fmt::print(stderr, "Packing failed: {}\n", error);
+        return false;
+    }
+}
+
+// eden-cli --unpack-nup <file.nup> [<out_dir>]; the output defaults to <name>/ next to the NUP.
+static bool UnpackNup(const std::string& source, const std::string& output) {
+    const auto to_path = [](const std::string& utf8) {
+        return std::filesystem::path{std::u8string{utf8.begin(), utf8.end()}};
+    };
+    const auto archive = to_path(source);
+    const auto out_dir =
+        output.empty() ? FileSys::Nup::DefaultExtractPath(archive) : to_path(output);
+    std::signal(SIGINT, [](int) { unpack_nup_cancel = true; });
+
+    const auto start = std::chrono::steady_clock::now();
+    auto last_report = start;
+    std::string error;
+    const auto result = FileSys::Nup::ExtractNup(
+        archive, out_dir,
+        [&](const FileSys::Nup::PackProgress& p) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_report < std::chrono::seconds(1) && p.files_done != p.files_total) {
+                return;
+            }
+            last_report = now;
+            fmt::print(stderr, "\r{} / {} MiB, {} / {} files", p.bytes_done >> 20,
+                       p.bytes_total >> 20, p.files_done, p.files_total);
+        },
+        &unpack_nup_cancel, &error);
+    const auto seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    fmt::print(stderr, "\n");
+    switch (result) {
+    case FileSys::Nup::ExtractResult::Success:
+        fmt::print(stderr, "Extracted to {} in {:.1f} s\n", out_dir.string(), seconds);
+        return true;
+    case FileSys::Nup::ExtractResult::Cancelled:
+        fmt::print(stderr, "Cancelled\n");
+        return false;
+    default:
+        fmt::print(stderr, "Extraction failed: {}\n", error);
+        return false;
+    }
+}
+
+static bool EditNup(const Core::LaunchParams& lp) {
+    const auto to_path = [](const std::string& utf8) {
+        return std::filesystem::path{std::u8string{utf8.begin(), utf8.end()}};
+    };
+    const auto archive = to_path(*lp.edit_nup_source);
+    FileSys::Nup::MetadataEdit edit;
+    if (lp.edit_nup_name) {
+        edit.title_name = *lp.edit_nup_name;
+    }
+    if (lp.edit_nup_publisher) {
+        edit.publisher = *lp.edit_nup_publisher;
+    }
+    if (lp.edit_nup_version) {
+        edit.display_version = *lp.edit_nup_version;
+    }
+    if (lp.edit_nup_icon) {
+        if (lp.edit_nup_icon->empty()) {
+            edit.icon = std::vector<u8>{};
+        } else {
+            const auto icon_path = to_path(*lp.edit_nup_icon);
+            std::ifstream in(icon_path, std::ios::binary);
+            if (!in) {
+                fmt::print(stderr, "Cannot read icon {}\n", icon_path.string());
+                return false;
+            }
+            edit.icon = std::vector<u8>((std::istreambuf_iterator<char>(in)), {});
+            if (edit.icon->empty()) {
+                fmt::print(stderr, "Icon file is empty\n");
+                return false;
+            }
+        }
+    }
+    if (!edit.title_name && !edit.icon && !edit.display_version && !edit.publisher) {
+        fmt::print(stderr, "Nothing to edit: pass --nup-name, --nup-icon, --nup-version or "
+                           "--nup-publisher (or a --clear-* flag)\n");
+        return false;
+    }
+    std::signal(SIGINT, [](int) { edit_nup_cancel = true; });
+    std::string error;
+    switch (FileSys::Nup::EditNupMetadata(archive, edit, &error, &edit_nup_cancel)) {
+    case FileSys::Nup::EditResult::Success:
+        fmt::print(stderr, "Updated {}\n", archive.string());
+        return true;
+    case FileSys::Nup::EditResult::NoChange:
+        fmt::print(stderr, "No changes to apply\n");
+        return true;
+    case FileSys::Nup::EditResult::Cancelled:
+        fmt::print(stderr, "Cancelled\n");
+        return false;
+    default:
+        fmt::print(stderr, "Edit failed: {}\n", error);
         return false;
     }
 }
@@ -344,12 +443,32 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 
     Core::ApplyLaunchParams(lp);
 
+    // Informational options already printed by ApplyLaunchParams; handle them before any
+    // archive operation so --help/--version never packs, unpacks or edits.
+    if (lp.print_help || lp.print_version) {
+        return SDL_APP_SUCCESS;
+    }
+
     if (lp.pack_nup_source) {
         return PackNup(*lp.pack_nup_source, lp.filepath) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
     }
 
+    if (lp.unpack_nup_source) {
+        return UnpackNup(*lp.unpack_nup_source, lp.filepath) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
+
+    if (lp.edit_nup_source) {
+        return EditNup(lp) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
+
     if (lp.filepath.empty()) {
         LOG_CRITICAL(Frontend, "Failed to load ROM: No ROM specified");
+        return SDL_APP_FAILURE;
+    }
+
+    state->network_initialized = Network::Init();
+    if (!state->network_initialized) {
+        LOG_CRITICAL(Network, "Failed to initialize room networking");
         return SDL_APP_FAILURE;
     }
 
@@ -477,7 +596,70 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 // keys, by SDL scancode, that many seconds after start. Lets hidden test runs drive menus.
 double Nx2KeyClockSeconds(); // emu_window_sdl3.cpp
 
-static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
+// EDEN_NX2_DIAG_DIR=<dir>: keys.txt there is read and removed while the game runs, for scripted
+// control (tools/nx2/lab_ctl.py press). One entry per line: "<code>" press, "-<code>" release, or
+// "<code> <milliseconds>" press and release after that long. Codes are SDL scancodes.
+static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::System& system) {
+    static const std::filesystem::path file = [] {
+        const char* dir = std::getenv("EDEN_NX2_DIAG_DIR");
+        return dir && *dir ? std::filesystem::path{dir} / "keys.txt" : std::filesystem::path{};
+    }();
+    if (file.empty()) {
+        return;
+    }
+    static std::vector<std::pair<double, int>> releases;
+    static double last_check = 0.0;
+    const double now = Nx2KeyClockSeconds();
+    std::erase_if(releases, [&](const std::pair<double, int>& release) {
+        if (release.first > now) {
+            return false;
+        }
+        input_subsystem.GetKeyboard()->ReleaseKey(static_cast<std::size_t>(release.second));
+        return true;
+    });
+    if (now - last_check < 0.05) {
+        return;
+    }
+    last_check = now;
+    // Renamed first, so a writer replacing the file is never read halfway.
+    const auto taken = std::filesystem::path{file}.replace_extension(".taken");
+    std::error_code error;
+    std::filesystem::rename(file, taken, error);
+    if (error) {
+        return;
+    }
+    std::ifstream in{taken};
+    std::string line;
+    while (std::getline(in, line)) {
+        // "gpu low|high": sets the GPU accuracy, as the Qt app's Change GPU Mode hotkey.
+        if (line.starts_with("gpu ")) {
+            const bool high = line.substr(4) == "high";
+            Settings::values.gpu_accuracy.SetValue(high ? Settings::GpuAccuracy::High
+                                                        : Settings::GpuAccuracy::Low);
+            system.ApplySettings();
+            LOG_INFO(Frontend, "Live keys: GPU accuracy {}", high ? "high" : "low");
+            continue;
+        }
+        int code = 0, milliseconds = -1;
+        if (std::sscanf(line.c_str(), "%d %d", &code, &milliseconds) < 1 || code == 0) {
+            continue;
+        }
+        LOG_INFO(Frontend, "Live keys: {} {}{}", code < 0 ? "release" : "press", code < 0 ? -code : code,
+                 milliseconds >= 0 ? fmt::format(" for {} ms", milliseconds) : "");
+        if (code < 0) {
+            input_subsystem.GetKeyboard()->ReleaseKey(static_cast<std::size_t>(-code));
+            continue;
+        }
+        input_subsystem.GetKeyboard()->PressKey(static_cast<std::size_t>(code));
+        if (milliseconds >= 0) {
+            releases.emplace_back(now + milliseconds / 1000.0, code);
+        }
+    }
+    in.close();
+    std::filesystem::remove(taken, error);
+}
+
+static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem, Core::System& system) {
     struct KeyEvent {
         double seconds; // when frame is 0
         u64 frame;      // "f<frame>:code": after that many presents
@@ -526,11 +708,12 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
         }
         ++next;
     }
+    RunLiveKeys(input_subsystem, system);
 }
 
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
-    RunKeyScript(state->input_subsystem);
+    RunKeyScript(state->input_subsystem, state->system);
     if (state->emu_window) {
         state->emu_window->ApplyPendingTitle();
     }
@@ -555,7 +738,11 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         void(state->system.Pause());
         state->system.ShutdownMainProcess();
     }
+    const bool network_initialized = state->network_initialized;
     delete state;
+    if (network_initialized) {
+        Network::Shutdown();
+    }
 }
 
 #define VMA_IMPLEMENTATION

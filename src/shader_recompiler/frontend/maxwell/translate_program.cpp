@@ -123,7 +123,9 @@ void AddNVNStorageBuffers(IR::Program& program) {
             continue;
         }
         const u32 offset{base + index * descriptor_size};
-        const auto it{std::ranges::find(descs, offset, &StorageBufferDescriptor::cbuf_offset)};
+        const auto it{std::ranges::find_if(descs, [=](const StorageBufferDescriptor& desc) {
+            return desc.cbuf_index == driver_cbuf && desc.cbuf_offset == offset;
+        })};
         if (it != descs.end()) {
             it->is_written |= program.info.stores_global_memory;
             continue;
@@ -409,7 +411,8 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         const u32 threads{program.stage == Stage::Task ? init & 0x3f : (shader_b >> 20) & 0x3f};
         program.workgroup_size = {(std::max)(threads, 1U), 1, 1};
         if (program.stage == Stage::Mesh) {
-            if (program.mesh.topology != 4) {
+            if (program.mesh.topology != 0 && program.mesh.topology != 1 &&
+                program.mesh.topology != 4) {
                 throw NotImplementedException("Mesh output topology {} (SET_MESH_SHADER_A {:#010x})",
                                               program.mesh.topology, shader_a);
             }
@@ -443,7 +446,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     Optimization::PositionPass(env, program);
     Optimization::BlitConstantsPass(env, program);
 
-    Optimization::GlobalMemoryToStorageBufferPass(program, normalized_host_info);
+    Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
     Optimization::GeometryCompactionPass(program, normalized_host_info);
     Optimization::TexturePass(env, program, normalized_host_info);
 

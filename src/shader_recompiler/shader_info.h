@@ -175,6 +175,9 @@ struct StorageBufferDescriptor {
     u32 cbuf_offset;
     u32 count;
     bool is_written;
+    /// When set, the buffer pointer is read from memory at this offset from the constant buffer
+    /// pointer, which is bound as its own descriptor.
+    u32 indirect_offset{~0U};
 
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
@@ -189,6 +192,9 @@ struct TextureBufferDescriptor {
     u32 secondary_shift_left;
     u32 count;
     u32 size_shift;
+    /// Index in Info::handle_programs when the handle is computed at draw time (read from a
+    /// storage buffer), ~0 when it is the constant buffer word.
+    u32 handle_program{~0U};
 
     auto operator<=>(const TextureBufferDescriptor&) const = default;
 };
@@ -203,6 +209,9 @@ struct ImageBufferDescriptor {
     u32 cbuf_offset;
     u32 count;
     u32 size_shift;
+    /// Index in Info::handle_programs when the handle is computed at draw time (read from a
+    /// storage buffer), ~0 when it is the constant buffer word.
+    u32 handle_program{~0U};
 
     auto operator<=>(const ImageBufferDescriptor&) const = default;
 };
@@ -240,6 +249,9 @@ struct ImageDescriptor {
     u32 cbuf_offset;
     u32 count;
     u32 size_shift;
+    /// Index in Info::handle_programs when the handle is computed at draw time (read from a
+    /// storage buffer), ~0 when it is the constant buffer word.
+    u32 handle_program{~0U};
 
     auto operator<=>(const ImageDescriptor&) const = default;
 };
@@ -253,15 +265,23 @@ struct MeshInfo {
     u32 payload_words{}; ///< Task output region / mesh input region, in 32-bit words
     u32 max_vertices{};
     u32 max_primitives{};
-    u32 topology{}; ///< SET_MESH_SHADER_A output topology (4 = triangles)
+    u32 topology{}; ///< SET_MESH_SHADER_A output topology (0 = points, 1 = lines, 4 = triangles)
     boost::container::static_vector<u32, 136> vertex_lines;
     boost::container::static_vector<u32, 136> primitive_lines;
+
+    /// Vertex indices per primitive, which is also its byte count in the map region.
+    [[nodiscard]] u32 PrimitiveVertices() const noexcept {
+        return topology == 0 ? 1 : topology == 1 ? 2 : 3;
+    }
 };
 
 struct Info {
     static constexpr size_t MAX_INDIRECT_CBUFS{14};
     static constexpr size_t MAX_CBUFS{18};
-    static constexpr size_t MAX_SSBOS{32};
+    /// Compute programs can bind up to MAX_SSBOS storage buffers; graphics programs and compute
+    /// programs with EDEN_NX2_WIDE_COMPUTE_SSBOS=0 keep the old limit of MAX_GRAPHICS_SSBOS.
+    static constexpr size_t MAX_SSBOS{64};
+    static constexpr size_t MAX_GRAPHICS_SSBOS{32};
 
     bool is_task{}; ///< Switch 2 task program (Stage::Task)
     bool is_mesh{}; ///< Switch 2 mesh program (Stage::Mesh)
@@ -332,6 +352,9 @@ struct Info {
     bool uses_atomic_s32_max{};
     bool uses_int64_bit_atomics{};
     bool uses_global_memory{};
+    /// Native global accesses whose pointer is chosen at run time: every storage buffer descriptor
+    /// is a candidate and its bound length (not an NVN size word) limits the range.
+    bool native_global_bounds{};
     bool uses_atomic_image_u32{};
     bool uses_shadow_lod{};
     bool uses_rescaling_uniform{};
