@@ -1976,10 +1976,15 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 void RasterizerVulkan::FlushAll() {}
 
 void RasterizerVulkan::SubmitNx2ListCopies() {
-    // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
-    // the longer DeferFlush interval (#161).
+    // Batched like fences: flushing after every dispatch with list copies cost Hyrule Warriors:
+    // Age of Imprisonment ~2 fps. A front waiting on a copy (ReadGpuWrittenCommands) requests the
+    // idle hook, which flushes it (FlushSplitIdle). EDEN_NX2_LIST_COPY_FLUSH=1: flush at once.
+    static const bool flush_at_once = [] {
+        const char* v = std::getenv("EDEN_NX2_LIST_COPY_FLUSH");
+        return v != nullptr && v[0] == '1';
+    }();
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) &&
-        (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush) || !scheduler.DeferFlush())) {
+        (flush_at_once || !scheduler.DeferFlush())) {
         VideoCommon::Nx2Profile::FlushOriginTag tag{VideoCommon::Nx2Profile::FlushOrigin::ListCopy};
         scheduler.Flush();
     }

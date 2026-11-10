@@ -29,7 +29,7 @@ enum class Opt : unsigned {
     FrontSleep,        ///< The split front sleeps instead of yielding while it waits
     SubmitBudget,      ///< 4096-draw native submission budget outside MoltenVK
     FragmentBarrier,   ///< FragmentBarrier deferred to the next draw that reads the pass
-    FenceFlush,        ///< 5 ms DeferFlush, command list copies submitted at once
+    FenceFlush,        ///< 5 ms DeferFlush (fences and command list copies)
     PipelineRetention, ///< Sixteen sessions of used pipelines, saved every 15 s
     SortedPageBatches,
     QmdScratch,
