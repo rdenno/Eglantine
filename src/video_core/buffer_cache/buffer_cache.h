@@ -1598,7 +1598,12 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                     const char* v = std::getenv("EDEN_NX2_BANK_PAGE_SHADOW");
                     return v != nullptr && v[0] == '1';
                 }();
+                static const bool bank_direct = [] {
+                    const char* v = std::getenv("EDEN_NX2_BANK_DIRECT");
+                    return v == nullptr || v[0] != '0';
+                }();
                 const bool by_page = page_shadow_setting && skip_this_frame;
+                boost::container::small_vector<std::pair<DAddr, u32>, 16> direct_ranges;
                 u32 offset_in_bank = 0;
                 u32 page_idx = 0;
                 while (by_page && offset_in_bank < check_size) {
@@ -1643,7 +1648,17 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                         page.initialized = static_cast<u16>(page.initialized | covered);
                         if (!already_cpu_modified) {
                             Nx2Profile::Add(Nx2Profile::Counter::BankPagesChanged, 1);
-                            memory_tracker.MarkRegionAsCpuModified(cur_addr, chunk_size);
+                            if (bank_direct) {
+                                if (!direct_ranges.empty() &&
+                                    direct_ranges.back().first + direct_ranges.back().second ==
+                                        cur_addr) {
+                                    direct_ranges.back().second += chunk_size;
+                                } else {
+                                    direct_ranges.emplace_back(cur_addr, chunk_size);
+                                }
+                            } else {
+                                memory_tracker.MarkRegionAsCpuModified(cur_addr, chunk_size);
+                            }
                             last_synced_count = 0;
                         }
                     }
@@ -1689,12 +1704,66 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                         shadow->initialized_mask |= page_bit;
                         if (!already_cpu_modified) {
                             Nx2Profile::Add(Nx2Profile::Counter::BankPagesChanged, 1);
-                            memory_tracker.MarkRegionAsCpuModified(cur_addr, chunk_size);
+                            if (bank_direct) {
+                                if (!direct_ranges.empty() &&
+                                    direct_ranges.back().first + direct_ranges.back().second ==
+                                        cur_addr) {
+                                    direct_ranges.back().second += chunk_size;
+                                } else {
+                                    direct_ranges.emplace_back(cur_addr, chunk_size);
+                                }
+                            } else {
+                                memory_tracker.MarkRegionAsCpuModified(cur_addr, chunk_size);
+                            }
                             last_synced_count = 0;
                         }
                     }
                     offset_in_bank += chunk_size;
                     ++page_idx;
+                }
+                if (!direct_ranges.empty()) {
+                    // The pages are still tracked, so uploading them here saves the unprotect and
+                    // re-protect a CPU-modified mark costs.
+                    upload_copies.clear();
+                    u64 total_size_bytes = 0;
+                    u64 largest_copy = 0;
+                    const DAddr buffer_start = buffer.CpuAddr();
+                    const DAddr buffer_end = buffer_start + buffer.SizeBytes();
+                    const auto add_upload = [&](DAddr start, DAddr end) {
+                        if (start >= end) {
+                            return;
+                        }
+                        const u64 range_size = end - start;
+                        upload_copies.push_back(BufferCopy{
+                            .src_offset = total_size_bytes,
+                            .dst_offset = start - buffer.cpu_addr_cached,
+                            .size = range_size,
+                        });
+                        total_size_bytes += range_size;
+                        largest_copy = (std::max)(largest_copy, range_size);
+                    };
+                    for (const auto& [range_addr, range_size] : direct_ranges) {
+                        const DAddr start = (std::max)(range_addr, buffer_start);
+                        const DAddr end = (std::min)(range_addr + range_size, buffer_end);
+                        if (start >= end) {
+                            continue;
+                        }
+                        DAddr upload_start = start;
+                        gpu_modified_ranges.ForEachInRange(
+                            start, end - start, [&](DAddr gpu_start, DAddr gpu_end) {
+                                add_upload(upload_start, gpu_start);
+                                upload_start = gpu_end;
+                            });
+                        add_upload(upload_start, end);
+                    }
+                    if (total_size_bytes != 0) {
+                        UploadMemory(
+                            buffer, total_size_bytes, largest_copy,
+                            std::span<BufferCopy>(upload_copies.data(), upload_copies.size()));
+                        if constexpr (!USE_MEMORY_MAPS_FOR_UPLOADS) {
+                            any_buffer_uploaded = true;
+                        }
+                    }
                 }
             }
         }
