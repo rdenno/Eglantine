@@ -214,6 +214,13 @@ enum class Counter : u32 {
     /// after the frame's first bind (bytes the default path uploads one frame late)
     BankRechecksSkippedByFrame,
     BankLateChanges,
+    /// Native 64 KiB banks with EDEN_NX2_BANK_PAGE_SHADOW: bank pages compared, and pages
+    /// another bank already compared this frame
+    BankPagesCompared,
+    BankPagesShared,
+    /// Native 64 KiB banks: draws that compared the guest bytes, and pages found changed (marked)
+    BankCompares,
+    BankPagesChanged,
     /// Nx2Perf draw_begin_coalesce: draw.begin writes counted into the entry before them (with
     /// EDEN_NX2_PERF_VERIFY: that would have been)
     DrawBeginCoalesced,
@@ -440,6 +447,17 @@ inline void Report(const char* thread_name = "GPU thread") {
         line += fmt::format(" | bank rechecks skipped by frame {:.0f}, bank late changes {:.0f}",
                             per_second(Counter::BankRechecksSkippedByFrame),
                             per_second(Counter::BankLateChanges));
+    }
+    if (data.counters[static_cast<size_t>(Counter::BankPagesCompared)] != 0 ||
+        data.counters[static_cast<size_t>(Counter::BankPagesShared)] != 0) {
+        line += fmt::format(" | bank pages compared {:.0f}, shared {:.0f}",
+                            per_second(Counter::BankPagesCompared),
+                            per_second(Counter::BankPagesShared));
+    }
+    if (data.counters[static_cast<size_t>(Counter::BankCompares)] != 0) {
+        line += fmt::format(" | bank compares {:.0f}, pages changed {:.0f}",
+                            per_second(Counter::BankCompares),
+                            per_second(Counter::BankPagesChanged));
     }
     if (data.counters[static_cast<size_t>(Counter::BindMemoHits)] != 0 || data.counters[static_cast<size_t>(Counter::BindMemoMisses)] != 0) {
         line += fmt::format(" | bind memo {:.0f} hits, {:.0f} misses",

@@ -581,6 +581,15 @@ public:
         std::array<u8, 0x10000> bytes{};
     };
     std::unordered_map<DAddr, NativeUniformBankShadow> native_indirect_uniform_shadow;
+    /// EDEN_NX2_BANK_PAGE_SHADOW: one shadow per guest page for all banks covering it, each
+    /// 256-byte block compared at most once per frame (banks at nearby addresses overlap).
+    struct NativeUniformPageShadow {
+        u64 frame_tick{~u64{0}};
+        u16 checked{};     ///< Blocks compared this frame
+        u16 initialized{}; ///< Blocks whose shadow bytes are valid
+        std::array<u8, Core::DEVICE_PAGESIZE> bytes{};
+    };
+    std::unordered_map<DAddr, NativeUniformPageShadow> native_uniform_page_shadow;
     std::array<std::pair<DAddr, NativeUniformBankShadow*>, 8> native_indirect_uniform_cache{};
     DAddr native_indirect_uniform_last_bank = ~DAddr{0};
     NativeUniformBankShadow* native_indirect_uniform_last_ptr = nullptr;

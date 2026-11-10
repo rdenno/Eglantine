@@ -1583,6 +1583,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             shadow->last_frame_tick = frame_tick;
             if (shadow->last_draw_ticket != native_indirect_uniform_draw_ticket) {
                 shadow->last_draw_ticket = native_indirect_uniform_draw_ticket;
+                Nx2Profile::Add(Nx2Profile::Counter::BankCompares, 1);
                 const u32 check_size = (std::min<u32>)(size, 0x10000U);
                 const u8* const base_ptr = device_memory.template GetPointer<u8>(device_addr);
                 const bool contiguous =
@@ -1590,9 +1591,65 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                     (check_size <= Core::DEVICE_PAGESIZE ||
                      base_ptr + (check_size - 1) ==
                          device_memory.template GetPointer<u8>(device_addr + check_size - 1));
+                // EDEN_NX2_BANK_PAGE_SHADOW=1 (with bank_once_per_frame): pages are compared
+                // against one shadow per guest page, at most once per frame however many banks
+                // cover them. Off by default: no fps change in Hyrule (few pages are shared).
+                static const bool page_shadow_setting = [] {
+                    const char* v = std::getenv("EDEN_NX2_BANK_PAGE_SHADOW");
+                    return v != nullptr && v[0] == '1';
+                }();
+                const bool by_page = page_shadow_setting && skip_this_frame;
                 u32 offset_in_bank = 0;
                 u32 page_idx = 0;
-                while (offset_in_bank < check_size) {
+                while (by_page && offset_in_bank < check_size) {
+                    const DAddr cur_addr = device_addr + offset_in_bank;
+                    const u32 page_offset = static_cast<u32>(cur_addr & Core::DEVICE_PAGEMASK);
+                    const u32 chunk_size = (std::min<u32>)(
+                        static_cast<u32>(Core::DEVICE_PAGESIZE) - page_offset,
+                        check_size - offset_in_bank);
+                    const u8* const ptr = contiguous
+                                              ? (base_ptr + offset_in_bank)
+                                              : device_memory.template GetPointer<u8>(cur_addr);
+                    if (ptr == nullptr) {
+                        break;
+                    }
+                    offset_in_bank += chunk_size;
+                    // Blocks the chunk touches, and those it covers whole (only those get marked).
+                    const u32 first = page_offset >> 8;
+                    const u32 last = (page_offset + chunk_size - 1) >> 8;
+                    const u32 touched = ((2U << last) - 1) & ~((1U << first) - 1);
+                    const u32 full_first = (page_offset + 255) >> 8;
+                    const u32 full_end = (page_offset + chunk_size) >> 8;
+                    const u32 covered = full_end > full_first
+                                            ? (((1U << full_end) - 1) & ~((1U << full_first) - 1))
+                                            : 0U;
+                    NativeUniformPageShadow& page =
+                        native_uniform_page_shadow[cur_addr & ~Core::DEVICE_PAGEMASK];
+                    if (page.frame_tick != frame_tick) {
+                        page.frame_tick = frame_tick;
+                        page.checked = 0;
+                    }
+                    if ((page.checked & touched) == touched) {
+                        Nx2Profile::Add(Nx2Profile::Counter::BankPagesShared, 1);
+                        continue;
+                    }
+                    Nx2Profile::Add(Nx2Profile::Counter::BankPagesCompared, 1);
+                    const bool already_cpu_modified =
+                        memory_tracker.IsRegionCpuModified(cur_addr, chunk_size);
+                    u8* const shadow_dst = page.bytes.data() + page_offset;
+                    if ((page.initialized & touched) != touched || already_cpu_modified ||
+                        std::memcmp(shadow_dst, ptr, chunk_size) != 0) {
+                        std::memcpy(shadow_dst, ptr, chunk_size);
+                        page.initialized = static_cast<u16>(page.initialized | covered);
+                        if (!already_cpu_modified) {
+                            Nx2Profile::Add(Nx2Profile::Counter::BankPagesChanged, 1);
+                            memory_tracker.MarkRegionAsCpuModified(cur_addr, chunk_size);
+                            last_synced_count = 0;
+                        }
+                    }
+                    page.checked = static_cast<u16>(page.checked | covered);
+                }
+                while (!by_page && offset_in_bank < check_size) {
                     const DAddr cur_addr = device_addr + offset_in_bank;
                     const u64 page_offset = cur_addr & Core::DEVICE_PAGEMASK;
                     const u32 chunk_size = static_cast<u32>((std::min<u64>)(
@@ -1631,6 +1688,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                         std::memcpy(shadow_dst, ptr, chunk_size);
                         shadow->initialized_mask |= page_bit;
                         if (!already_cpu_modified) {
+                            Nx2Profile::Add(Nx2Profile::Counter::BankPagesChanged, 1);
                             memory_tracker.MarkRegionAsCpuModified(cur_addr, chunk_size);
                             last_synced_count = 0;
                         }
