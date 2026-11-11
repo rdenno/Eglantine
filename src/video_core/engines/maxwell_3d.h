@@ -3441,6 +3441,9 @@ private:
     /// the back proved its exact programs write no memory, Gpu otherwise.
     VideoCommon::SplitWriteTracker::Effect FrontDrawEffect(VideoCommon::GpuSplit& split,
                                                            FrontState& state);
+    /// Whether the native macro at `method` reads the six Compare words at an address and sets
+    /// render_enable.mode from them (found by a dry run, once per macro).
+    bool IsPredicateMacro(FrontState& state, u32 method);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;

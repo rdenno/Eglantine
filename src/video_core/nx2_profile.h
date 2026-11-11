@@ -8,10 +8,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <deque>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "common/common_types.h"
 #include "video_core/gpu_split.h"
@@ -64,6 +68,10 @@ enum class Zone : u32 {
     BindStorage,       ///< Of bind stage buffers: storage buffers (touch, sync, usage, bind)
     BackReplay,   ///< Split back: decoding ring entries (Execute) outside the zones it calls
     BackIdleHook, ///< Split back: the idle hook (deferred submits) outside the zones it calls
+    WritesCheck,  ///< Front: does this method write memory (NoteWriter bookkeeping)
+    FrontWrite,   ///< Front: one register write (shadow RAM, same-value filter, queueing)
+    FrontQueue,   ///< Front: handing a method or run to the back's queue
+    CommandRead,  ///< Front: reading command words from guest memory
     Count,
 };
 
@@ -77,14 +85,57 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "fence skipped", "method", "split drain", "split wait", "signal ordering",
     "list copy wait",
     "bind uniform bank", "bind uniform stream", "bind uniform cached", "bind storage",
-    "back replay", "back idle hook",
+    "back replay", "back idle hook", "writes check", "front write", "front queue",
+    "command read",
 };
+static_assert(zone_names.back() != nullptr, "zone_names is missing entries");
 
-// Read once at startup: Enabled() runs several times per method write (no guard to check).
-inline const bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+// On from startup with EDEN_NX2_GPU_PROFILE; the MCP server can toggle it. Enabled() runs several
+// times per method write: a relaxed load is as cheap as the plain bool it replaced.
+inline std::atomic<bool> g_enabled{std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr};
+/// Report window (each thread logs and publishes its totals this often).
+inline std::atomic<u64> g_window_ns{10'000'000'000ULL};
 
 inline bool Enabled() {
-    return g_enabled;
+    return g_enabled.load(std::memory_order_relaxed);
+}
+
+/// Bumped on every toggle: threads drop totals from before it (thread_local, so they reset
+/// themselves at their next Report).
+inline std::atomic<u32> g_generation{0};
+
+/// Turns the profiler on or off at runtime (thread-safe). Each thread restarts its window at
+/// its next Report, so the first numbers after a toggle take one full window.
+inline void SetEnabled(bool enabled) {
+    g_generation.fetch_add(1, std::memory_order_relaxed);
+    g_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+/// One thread's last report, per second of wall time (for the MCP gpu_profile tool).
+struct Snapshot {
+    std::string thread;
+    u64 when_ns{};   ///< Now() at the report
+    u64 window_ns{};
+    /// Exclusive time (ms) and entries of one zone, both per second.
+    struct ZoneStat {
+        const char* name;
+        double ms;
+        double calls;
+    };
+    std::vector<ZoneStat> zones;
+    std::vector<std::pair<const char*, double>> counters;
+};
+
+/// Guards Snapshots(): Report writes under it from each profiled thread.
+inline std::mutex& SnapshotMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+/// Last report per thread name. Lock SnapshotMutex() while reading.
+inline std::map<std::string, Snapshot>& Snapshots() {
+    static std::map<std::string, Snapshot> snapshots;
+    return snapshots;
 }
 
 // Nanoseconds; from the host's own counter where the wall clock reads it directly (the zones
@@ -132,9 +183,66 @@ struct ThreadData {
     std::array<MacroCounts, 128> macros{};
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
+    u32 generation{};
 };
 
 inline thread_local ThreadData t_data;
+
+/// Totals since the thread started, never reset by the report window: the frame spike recorder
+/// (nx2_spikes.h) takes their difference over one frame. Only the first 10 counters (through
+/// Counter::DmaReadsSkipped, the ones nx2_spikes.cpp names) are kept.
+struct Totals {
+    std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
+    std::array<u64, static_cast<size_t>(Zone::Count)> count{};
+    std::array<u64, 10> counters{};
+};
+inline thread_local Totals t_totals;
+
+/// A thread's totals as other threads read them, refreshed by Report while g_publish is set.
+struct PublishedTotals {
+    explicit PublishedTotals(std::string thread_) : thread{std::move(thread_)} {}
+    std::string thread;
+    std::array<std::atomic<u64>, static_cast<size_t>(Zone::Count)> exclusive_ns{};
+    std::array<std::atomic<u64>, static_cast<size_t>(Zone::Count)> count{};
+    std::array<std::atomic<u64>, 10> counters{};
+};
+
+inline std::atomic<bool> g_publish{false};
+
+inline std::mutex& PublishedMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+/// One entry per profiled thread name; entries are never removed (stable addresses).
+inline std::deque<PublishedTotals>& PublishedThreads() {
+    static std::deque<PublishedTotals> threads;
+    return threads;
+}
+
+inline void Publish(const char* thread_name, u64 now) {
+    // Report runs between commands, far more often than a frame needs.
+    static thread_local u64 last_publish{};
+    static thread_local PublishedTotals* published{};
+    if (now - last_publish < 500'000) {
+        return;
+    }
+    last_publish = now;
+    if (published == nullptr) {
+        std::scoped_lock lock{PublishedMutex()};
+        auto& threads = PublishedThreads();
+        const auto it = std::find_if(threads.begin(), threads.end(),
+                                     [&](const PublishedTotals& t) { return t.thread == thread_name; });
+        published = it != threads.end() ? &*it : &threads.emplace_back(thread_name);
+    }
+    for (size_t i = 0; i < t_totals.exclusive_ns.size(); ++i) {
+        published->exclusive_ns[i].store(t_totals.exclusive_ns[i], std::memory_order_relaxed);
+        published->count[i].store(t_totals.count[i], std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < t_totals.counters.size(); ++i) {
+        published->counters[i].store(t_totals.counters[i], std::memory_order_relaxed);
+    }
+}
 
 class Scope {
 public:
@@ -156,6 +264,8 @@ public:
         const auto index = static_cast<size_t>(zone);
         data.exclusive_ns[index] += elapsed - data.child_ns;
         ++data.count[index];
+        t_totals.exclusive_ns[index] += elapsed - data.child_ns;
+        ++t_totals.count[index];
         data.child_ns = parent_child_ns + elapsed;
     }
 
@@ -179,6 +289,8 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    DmaReadsDrained, ///< MME DMA reads that waited for the split's back (Maxwell3D::FrontDmaRead)
+    DmaReadsSkipped, ///< MME DMA reads served without waiting for the back
     DmaReadsEarly,  ///< MME DMA reads without a drain (Maxwell3D::FrontDmaReadEarly)
     DmaReadsWaitUnknown, ///< Of those, waited for a write the front can't place
     DmaReadsWaitGpu,     ///< waited for all queued GPU work with unknown destinations
@@ -234,6 +346,8 @@ enum class Counter : u32 {
 };
 
 static_assert(static_cast<size_t>(Counter::Count) <= std::tuple_size_v<decltype(ThreadData::counters)>);
+static_assert(static_cast<size_t>(Counter::DmaReadsSkipped) + 1 ==
+              std::tuple_size_v<decltype(Totals::counters)>);
 
 /// The fencing thread's buffer downloads (BufferCache::PopAsyncBuffers): logged by the thread
 /// that makes the fences.
@@ -250,7 +364,11 @@ inline std::unordered_set<u64>& DmaReadPages() {
 
 inline void Add(Counter counter, u64 amount) {
     if (Enabled()) {
-        t_data.counters[static_cast<size_t>(counter)] += amount;
+        const auto index = static_cast<size_t>(counter);
+        t_data.counters[index] += amount;
+        if (index < t_totals.counters.size()) {
+            t_totals.counters[index] += amount;
+        }
     }
 }
 
@@ -346,13 +464,18 @@ inline void Report(const char* thread_name = "GPU thread") {
     }
     auto& data = t_data;
     const u64 now = Now();
-    if (data.window_start == 0) {
+    if (g_publish.load(std::memory_order_relaxed)) {
+        Publish(thread_name, now);
+    }
+    const u32 generation = g_generation.load(std::memory_order_relaxed);
+    if (data.window_start == 0 || data.generation != generation) {
+        data = {};
         data.window_start = now;
-        data.child_ns = 0;
+        data.generation = generation;
         return;
     }
     const u64 window = now - data.window_start;
-    if (window < 10'000'000'000ULL) {
+    if (window < g_window_ns.load(std::memory_order_relaxed)) {
         return;
     }
     // Time in no zone at all is the wall time minus the zones' totals.
@@ -398,10 +521,10 @@ inline void Report(const char* thread_name = "GPU thread") {
     }
     line += fmt::format(" | MME DMA reads without a drain {:.0f} (waited for: unknown writes "
                         "{:.0f}, GPU work {:.0f}, writes to the words {:.0f})",
-                        static_cast<double>(data.counters[8]) * 1e9 / window,
-                        static_cast<double>(data.counters[9]) * 1e9 / window,
-                        static_cast<double>(data.counters[10]) * 1e9 / window,
-                        static_cast<double>(data.counters[11]) * 1e9 / window);
+                        per_second(Counter::DmaReadsEarly),
+                        per_second(Counter::DmaReadsWaitUnknown),
+                        per_second(Counter::DmaReadsWaitGpu),
+                        per_second(Counter::DmaReadsWaitWrite));
     if (data.counters[static_cast<size_t>(Counter::DirectWrites)] != 0 || data.counters[static_cast<size_t>(Counter::MacroWrites)] != 0) {
         line += fmt::format(" | front 3D writes: direct {:.0f}, from macros {:.0f}",
                             static_cast<double>(data.counters[static_cast<size_t>(Counter::DirectWrites)]) * 1e9 / window,
@@ -526,8 +649,53 @@ inline void Report(const char* thread_name = "GPU thread") {
     if (!macros.empty()) {
         LOG_INFO(HW_GPU, "{} macros per second (top 12 by calls):{}", thread_name, macros);
     }
+    {
+        static constexpr std::array<const char*, static_cast<size_t>(Counter::Count)>
+            counter_names{"download_bytes",  "download_copies",
+                          "mme_dma_read_bytes", "download_bytes_on_dma_pages",
+                          "method_writes",   "same_value_writes",
+                          "acquire_checks",  "acquire_waits",
+                          "dma_reads_drained", "dma_reads_skipped",
+                          "dma_reads_early", "dma_reads_wait_unknown",
+                          "dma_reads_wait_gpu", "dma_reads_wait_write",
+                          "acquire_polls", "acquire_polls_met",
+                          "direct_writes", "macro_writes",
+                          "same_executable_writes",
+                          "download_age_60", "download_age_120",
+                          "download_age_600", "download_age_3600",
+                          "download_age_older", "download_age_none",
+                          "bind_memo_hits", "bind_memo_misses",
+                          "dma_reads_writer_set", "dma_reads_writer_set_fallback",
+                          "dma_reads_overlay_no_wait", "dma_reads_overlay_waited",
+                          "dma_reads_wait_write_other", "dma_reads_wait_write_cb_lost",
+                          "dma_reads_wait_write_cb_older", "dma_reads_overlay_fallback",
+                          "bank_rechecks_skipped_by_frame", "bank_late_changes",
+                          "bank_pages_compared", "bank_pages_shared",
+                          "bank_compares", "bank_pages_changed",
+                          "draw_begin_coalesced",
+                          "pending_waits", "pending_wake_push",
+                          "pending_wake_latch", "pending_wake_timeout"};
+        static_assert(counter_names.back() != nullptr, "counter_names is missing entries");
+        const double per_s = 1e9 / static_cast<double>(window);
+        Snapshot snap{.thread = thread_name, .when_ns = now, .window_ns = window};
+        for (size_t i = 0; i < data.exclusive_ns.size(); ++i) {
+            if (data.exclusive_ns[i] != 0 || data.count[i] != 0) {
+                snap.zones.push_back({zone_names[i],
+                                      static_cast<double>(data.exclusive_ns[i]) * 1000.0 /
+                                          static_cast<double>(window),
+                                      static_cast<double>(data.count[i]) * per_s});
+            }
+        }
+        for (size_t i = 0; i < counter_names.size(); ++i) {
+            snap.counters.emplace_back(counter_names[i],
+                                       static_cast<double>(data.counters[i]) * per_s);
+        }
+        std::scoped_lock lock{SnapshotMutex()};
+        Snapshots()[thread_name] = std::move(snap);
+    }
     data = {};
     data.window_start = now;
+    data.generation = generation;
 }
 
 } // namespace VideoCommon::Nx2Profile

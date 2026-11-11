@@ -83,6 +83,8 @@ add_executable(yuzu
     configuration/configure_graphics_extensions.cpp
     configuration/configure_graphics_extensions.h
     configuration/configure_graphics_extensions.ui
+    configuration/configure_performance.cpp
+    configuration/configure_performance.h
     configuration/configure_hotkeys.cpp
     configuration/configure_hotkeys.h
     configuration/configure_hotkeys.ui
@@ -224,6 +226,7 @@ add_executable(yuzu
     yuzu.rc
     migration_dialog.h migration_dialog.cpp
     nup_dialogs.h nup_dialogs.cpp
+    shader_warm_dialog.h shader_warm_dialog.cpp
     migration_worker.h migration_worker.cpp
     libqt_common.h libqt_common.cpp
 
@@ -416,6 +419,13 @@ elseif(WIN32)
 endif()
 
 target_link_libraries(yuzu PRIVATE nlohmann_json::nlohmann_json)
+
+if (ENABLE_MCP_SERVER)
+    target_sources(yuzu PRIVATE mcp_host_qt.cpp mcp_host_qt.h
+        configuration/configure_mcp.cpp configuration/configure_mcp.h)
+    target_link_libraries(yuzu PRIVATE mcp)
+    target_compile_definitions(yuzu PRIVATE YUZU_ENABLE_MCP)
+endif()
 target_link_libraries(yuzu PRIVATE common core input_common frontend_common network video_core qt_common)
 target_link_libraries(yuzu PRIVATE Boost::headers Qt6::Widgets Qt6::Charts Qt6::Concurrent)
 # Unpacks NVIDIA's files from the Streamline release (nvidia_dlss_panel.cpp).

@@ -119,6 +119,10 @@ add_library(video_core STATIC
     nx2_profile.h
     nx2_perf.cpp
     nx2_perf.h
+    nx2_spikes.cpp
+    nx2_spikes.h
+    nx2_timeline.cpp
+    nx2_timeline.h
     ocarina_upscale.h
     present.h
     pte_kind.h
@@ -188,6 +192,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_camera_motion_pass.cpp
     renderer_vulkan/vk_camera_motion_pass.h
     renderer_vulkan/vk_compute_pipeline.cpp
+    renderer_vulkan/vk_driver_build_report.cpp
+    renderer_vulkan/vk_driver_build_report.h
     renderer_vulkan/vk_compute_pipeline.h
     renderer_vulkan/vk_cooperative_hmma_test.cpp
     renderer_vulkan/vk_cooperative_hmma_test.h
@@ -258,9 +264,17 @@ add_library(video_core STATIC
     shader_cache.h
     shader_environment.cpp
     shader_environment.h
+    stage_cache.cpp
+    stage_cache.h
     shader_handle_program.h
     shader_notify.cpp
     shader_notify.h
+    shader_warm/shader_archives.cpp
+    shader_warm/shader_archives.h
+    shader_warm/shader_warm_builder.cpp
+    shader_warm/shader_warm_builder.h
+    shader_warm/warm_records.cpp
+    shader_warm/warm_records.h
     smaa_area_tex.h
     smaa_search_tex.h
     surface.cpp
@@ -444,6 +458,8 @@ if (ENABLE_OPENGL)
 endif()
 
 target_link_libraries(video_core PUBLIC common core)
+# Shader precache builder: game archives use zstd (also with dictionaries) and zlib.
+target_link_libraries(video_core PRIVATE zstd::zstd ZLIB::ZLIB)
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
 if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)

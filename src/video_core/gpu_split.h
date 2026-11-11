@@ -51,6 +51,18 @@ enum class DrainSite : u32 {
     FrontStart,     ///< The front takes an engine's macros over
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
     Count,
+
+    PullerRelease = AcquirePoll,
+    PullerAcquireCheck = AcquireTrigger,
+    PullerAcquirePoll = AcquirePoll,
+    PullerAcquire = Acquire,
+    PullerFences = FenceRelease,
+    CmdListFlush = ListFlush,
+    MapUnmap = Map,
+    ComputeFront = FrontStart,
+    Verify = FrontVerify,
+    WritersCmdList = ListWriters,
+    WritersCmdRead = ListWriters,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
@@ -79,6 +91,10 @@ public:
     /// Whether the front sends work to the back (front thread only).
     [[nodiscard]] bool Active() const {
         return active;
+    }
+    /// How often the split started: state the front copied during an earlier start is stale.
+    [[nodiscard]] u32 Starts() const {
+        return starts;
     }
     /// Whether the front runs the engines' macros (EDEN_NX2_SPLIT=2).
     [[nodiscard]] bool FrontMacros() const {
@@ -146,13 +162,42 @@ public:
                      u32 amount, u32 methods_pending, const GPUVAddr* segment,
                      Effect effect = Effect::Unknown);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
+    /// With EDEN_NX2_MACRO_RUNS=1, consecutive macro writes to one engine go into one Run entry.
     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
                     Effect effect = Effect::Unknown) {
         SelectEngine(engine);
-        u64* const entry = Reserve(1);
-        entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
-                   (u64{argument} << 32);
-        Commit(1, effect);
+        if (!macro_runs) [[likely]] {
+            u64* const entry = Reserve(1);
+            entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct |
+                       (u64{method & 0xffff} << 8) | (u64{argument} << 32);
+            Commit(1, effect);
+            return;
+        }
+        const u64 word = (u64{method & 0xffff} << 8) | (u64{argument} << 32);
+        if (open_run != nullptr && open_run_end == write_position &&
+            ((open_run[0] >> 8) & 0xffffff) < MaxRunWrites) {
+            u64* const next = Reserve(1);
+            // Reserve may have wrapped or published (closing the run): append only right after
+            // the run's last word.
+            if (open_run != nullptr && next == open_run + 1 + ((open_run[0] >> 8) & 0xffffff)) {
+                *next = word;
+                open_run[0] += u64{1} << 8;
+                Commit(1, effect);
+                if (open_run != nullptr) {
+                    open_run_end = write_position;
+                }
+                return;
+            }
+            open_run = nullptr;
+        }
+        u64* const entry = Reserve(2);
+        entry[0] = static_cast<u64>(Kind::Run) | (u64{1} << 8);
+        entry[1] = word;
+        open_run = entry;
+        Commit(2, effect);
+        if (open_run != nullptr) {
+            open_run_end = write_position;
+        }
     }
 
     /// Nx2Perf draw_begin_coalesce: Method (MacroWrite when `direct`) for an executable write
@@ -223,6 +268,7 @@ public:
 
     /// Makes what was sent visible to the back.
     void Publish();
+    using DrainSite = VideoCommon::DrainSite;
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
 
@@ -235,7 +281,7 @@ public:
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
-    bool WaitForWriters();
+    bool WaitForWriters(DrainSite site = DrainSite::ListWriters);
     /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
@@ -244,7 +290,12 @@ public:
     }
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
-    bool WaitForSync();
+    bool WaitForSync(DrainSite site = DrainSite::ListSync);
+    /// Waits until the back executed the compute and copy work sent before the last NoteSync,
+    /// the writers a command list fetched now is ordered after (the hardware fetches a list ahead
+    /// of the engines, so work sent after the last host-level wait is not). Returns whether any of
+    /// it was still queued.
+    bool WaitForSyncedWriters(DrainSite site = DrainSite::ListWriters);
     /// The entry just sent also writes [address, address + size) of `memory`, noted by device
     /// page (other mappings may alias it, and the caches keep state per page). Returns whether
     /// it was noted by range (not as an unknown write).
@@ -325,14 +376,15 @@ public:
 
 private:
     friend struct GpuSplitTestAccess;
-
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
         Engine, ///< The engine the next methods go to: word 1
         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        Run,    ///< Bits 8-31 count; then count macro writes (bits 8-23 method, 32-63 argument)
     };
+    static constexpr u64 MaxRunWrites = (u64{1} << 24) - 1;
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
@@ -411,6 +463,8 @@ private:
     bool eager_publish{}; ///< Nx2Perf::Opt::EagerPublish, read once at Start
     /// Nx2Perf::Verify() with draw_begin_coalesce, read once at Start before the back starts
     bool verify_repeats{};
+    u32 starts{};
+    bool macro_runs{false}; ///< EDEN_NX2_MACRO_RUNS=1: consecutive macro writes in one Run entry
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
 
@@ -442,6 +496,9 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    /// The Run entry MacroWrite appends to (unpublished, nothing written after it), or null.
+    u64* open_run{};
+    u64 open_run_end{};
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};

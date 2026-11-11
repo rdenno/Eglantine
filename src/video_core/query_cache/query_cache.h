@@ -26,6 +26,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/query_cache/bank_base.h"
+#include "video_core/nx2_job_stats.h"
 #include "video_core/query_cache/query_base.h"
 #include "video_core/query_cache/query_cache_base.h"
 #include "video_core/query_cache/query_stream.h"
@@ -295,10 +296,16 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
              ? !Settings::IsGPULevelHigh()
              : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) &&
         is_fence;
-    // Fits beside query_location and is_synced: the capture stays within the SBO limit below.
+    // Without delayed fence operations only fence-flagged reports wait for the host GPU to write.
+    const bool delayed_release = is_fence && counter_type == QueryType::Payload &&
+                                 (Settings::IsGPUFenceBehaviorDefault()
+                                      ? !Settings::IsGPULevelHigh()
+                                      : !Settings::IsGPUFenceBehaviorBalanced() &&
+                                            !Settings::IsGPUFenceBehaviorAccurate());
     const u16 settle_slot = static_cast<u16>(Tegra::Nx2AsyncReportSlot(cpu_addr));
-    auto operation_fn = [this, query_base = query, pointer, query_location, is_synced,
-                         settle_slot] {
+    // The query, its pointer and the settle slot are derived from query_location and cpu_addr
+    // inside, so the capture stays within the SBO limit below.
+    auto operation_fn = [this, cpu_addr, query_location, payload, is_synced, delayed_release] {
         // Whatever path this takes, the slot's result write is done when it returns.
         struct Settle {
             u16 slot;
@@ -306,7 +313,14 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                 Tegra::g_nx2_async_reports_completed[slot].fetch_add(1,
                                                                      std::memory_order_release);
             }
-        } const settle{settle_slot};
+        } const settle{static_cast<u16>(Tegra::Nx2AsyncReportSlot(cpu_addr))};
+        SCOPE_EXIT {
+            if (delayed_release) {
+                Tegra::Nx2SemaphoreWaiters::Get().OnDelayedReleaseDone(cpu_addr, payload);
+            }
+        };
+        auto* const query_base = impl->ObtainQuery(query_location);
+        u8* const value_pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (!is_synced) [[likely]] {
                 impl->pending_unregister.push_back(query_location);
@@ -330,10 +344,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             u8* const pointer_timestamp =
                 impl->device_memory.template GetPointer<u8>(query_cpu_addr + 8);
             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
-            std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
+            std::memcpy(value_pointer, &query_base->value, sizeof(query_base->value));
         } else {
             const u32 value = static_cast<u32>(query_base->value);
-            std::memcpy(pointer, &value, sizeof(value));
+            std::memcpy(value_pointer, &value, sizeof(value));
         }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(query_cpu_addr,
                                                   static_cast<u32>(query_base->value));
@@ -346,6 +360,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     std::function<void()> operation(std::move(operation_fn));
     Tegra::g_nx2_async_reports_issued[settle_slot].fetch_add(1, std::memory_order_release);
     if (is_fence) {
+        if (delayed_release) {
+            Tegra::Nx2SemaphoreWaiters::Get().OnDelayedRelease(cpu_addr, payload);
+        }
         impl->rasterizer.SignalFence(std::move(operation));
     } else {
         impl->rasterizer.SyncOperation(std::move(operation));
@@ -474,6 +491,7 @@ bool QueryCacheBase<Traits>::AccelerateHostConditionalRendering() {
 
     auto& regs = maxwell3d->regs;
     if (regs.render_enable_override != Maxwell::Regs::RenderEnable::Override::UseRenderEnable) {
+        VideoCommon::Nx2JobStats::CondNote(VideoCommon::Nx2JobStats::CondReason::Override);
         impl->runtime.EndHostConditionalRendering();
         return false;
     }
@@ -481,9 +499,11 @@ bool QueryCacheBase<Traits>::AccelerateHostConditionalRendering() {
     const GPUVAddr address = regs.render_enable.Address();
     switch (mode) {
     case ComparisonMode::True:
+        VideoCommon::Nx2JobStats::CondNote(VideoCommon::Nx2JobStats::CondReason::TrueFalse);
         impl->runtime.EndHostConditionalRendering();
         return false;
     case ComparisonMode::False:
+        VideoCommon::Nx2JobStats::CondNote(VideoCommon::Nx2JobStats::CondReason::TrueFalse);
         impl->runtime.EndHostConditionalRendering();
         return false;
     case ComparisonMode::Conditional: {

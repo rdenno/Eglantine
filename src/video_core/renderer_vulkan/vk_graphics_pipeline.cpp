@@ -19,7 +19,9 @@
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
+#include "video_core/nx2_draw_stats.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -604,7 +606,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     return TexturePair(raw, via_header_index);
                 }
             }
-            return TexturePair(read_word(addr), via_header_index);
+            VideoCommon::Nx2DrawStats::Timer handle_probe{VideoCommon::Nx2DrawStats::Site::HandleRead};
+            const u32 raw_handle = read_word(addr);
+            if (VideoCommon::Nx2DrawStats::Enabled()) [[unlikely]] {
+                handle_probe.hit = VideoCommon::Nx2DrawStats::SameAsLast(addr, raw_handle);
+            }
+            return TexturePair(raw_handle, via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
@@ -1668,6 +1675,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
+    const auto build_begin = std::chrono::steady_clock::now();
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
@@ -1693,6 +1701,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    DriverBuildReport::Record(DriverBuildReport::Kind::Graphics,
+                              std::chrono::steady_clock::now() - build_begin);
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

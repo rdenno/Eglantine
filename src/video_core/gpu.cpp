@@ -135,7 +135,8 @@ struct GPU::Impl {
     template <typename Func>
     [[nodiscard]] u64 RequestSyncOperation(Func&& action) {
         std::unique_lock lck{sync_request_mutex};
-        const u64 fence = ++last_sync_fence;
+        const u64 fence = last_sync_fence.load(std::memory_order_relaxed) + 1;
+        last_sync_fence.store(fence, std::memory_order_release);
         sync_requests.emplace_back(std::forward<Func>(action));
         has_sync_requests.store(true, std::memory_order_release);
         return fence;
@@ -161,8 +162,12 @@ struct GPU::Impl {
     void TickWork() {
         // Nx2Perf draw_preamble: the flag is set under the mutex with every enqueue and cleared
         // under it only once the list is empty, so an empty list skips the mutex.
-        static const bool fast_check =
-            VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::DrawPreamble);
+        // EDEN_NX2_TICKWORK_SKIP=0 takes the lock every time.
+        static const bool fast_check = [] {
+            const char* value = std::getenv("EDEN_NX2_TICKWORK_SKIP");
+            return (value == nullptr || value[0] != '0') &&
+                   VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::DrawPreamble);
+        }();
         if (fast_check && !has_sync_requests.load(std::memory_order_acquire)) {
             return;
         }
@@ -402,7 +407,7 @@ struct GPU::Impl {
     std::atomic<bool> has_sync_requests{};
     std::atomic<u64> current_sync_fence{};
     std::atomic<u64> present_ns{};
-    u64 last_sync_fence{};
+    std::atomic<u64> last_sync_fence{}; ///< The last request's fence (written under the mutex)
 
     // Maps queued by MapInOrder and not run yet, by the GPU addresses they change.
     struct PendingMap {

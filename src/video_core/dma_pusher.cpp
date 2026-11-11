@@ -15,6 +15,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/memory.h"
+#include "video_core/nx2_knobs.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/control/channel_state.h"
@@ -220,8 +221,15 @@ bool DmaPusher::Step() {
         // billions of instances and lost the device loading a race).
         bool gpu_written =
             IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+        // EDEN_NX2_SYNCED_WRITERS=0 waits for every writer sent so far, as before: only the
+        // work before the last host-level wait is ordered before this fetch on the hardware.
+        static const bool synced_writers = [] {
+            const char* value = std::getenv("EDEN_NX2_SYNCED_WRITERS");
+            return value == nullptr || value[0] != '0';
+        }();
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
+            (synced_writers ? VideoCommon::GpuSplit::Get().WaitForSyncedWriters()
+                            : VideoCommon::GpuSplit::Get().WaitForWriters())) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         }
@@ -265,8 +273,12 @@ bool DmaPusher::Step() {
                                       : gpu_written ? GpuWritten
                                                     : SafeDirty;
                 std::vector<u32> live(header.size);
-                memory_manager.ReadBlockUnsafe(dma_state.dma_get, live.data(),
-                                               live.size() * sizeof(u32));
+                {
+                    VideoCommon::Nx2Profile::Scope read_scope{
+                        VideoCommon::Nx2Profile::Zone::CommandRead};
+                    memory_manager.ReadBlockUnsafe(dma_state.dma_get, live.data(),
+                                                   live.size() * sizeof(u32));
+                }
                 const CommandHeader* const copy = command_list.submitted_words.data() +
                                                   command_list.submitted_offsets[dma_pushbuffer_subindex];
                 u32 first = ~0U, words = 0;
@@ -480,7 +492,9 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
 // FrontCallMethod sequence CallMethod makes word by word, then the state that loop leaves.
 bool DmaPusher::FrontRun(std::span<const CommandHeader> commands, size_t word_offset,
                          size_t& index) {
-    if (!VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FrontRun)) {
+    if (!VideoCommon::Nx2Knob::Live(
+            VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FrontRun),
+            VideoCommon::Nx2Knob::FrontBatch)) {
         return false;
     }
     auto& split = VideoCommon::GpuSplit::Get();
@@ -654,7 +668,11 @@ void DmaPusher::CallMethod(u32 argument) {
         }
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
         const auto engine_type = subchannel_type[dma_state.subchannel];
-        const bool writer = IsMemoryWriter(*subchannel, engine_type, dma_state.method);
+        bool writer = false;
+        if (split.Active()) {
+            VideoCommon::Nx2Profile::Scope check_scope{VideoCommon::Nx2Profile::Zone::WritesCheck};
+            writer = IsMemoryWriter(*subchannel, engine_type, dma_state.method);
+        }
         // Copies and blits are GPU work for the front's reads (GpuSplit::Effect).
         const auto effect = engine_type == Engines::EngineTypes::MaxwellDMA ||
                                     engine_type == Engines::EngineTypes::Fermi2D
@@ -686,6 +704,7 @@ void DmaPusher::CallMethod(u32 argument) {
                     }
                 }
             }
+            VideoCommon::Nx2Profile::Scope queue_scope{VideoCommon::Nx2Profile::Zone::FrontQueue};
             split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
                          opt_segment, effect);
             return;
@@ -718,7 +737,11 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         }
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
         const auto engine_type = subchannel_type[dma_state.subchannel];
-        const bool writer = IsMemoryWriter(*subchannel, engine_type, dma_state.method);
+        bool writer = false;
+        if (split.Active()) {
+            VideoCommon::Nx2Profile::Scope check_scope{VideoCommon::Nx2Profile::Zone::WritesCheck};
+            writer = IsMemoryWriter(*subchannel, engine_type, dma_state.method);
+        }
         // Copies and blits are GPU work for the front's reads (GpuSplit::Effect).
         const auto effect = engine_type == Engines::EngineTypes::MaxwellDMA ||
                                     engine_type == Engines::EngineTypes::Fermi2D
@@ -750,6 +773,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                     }
                 }
             }
+            VideoCommon::Nx2Profile::Scope queue_scope{VideoCommon::Nx2Profile::Zone::FrontQueue};
             split.MultiMethod(subchannel, dma_state.method, base_start, num_methods,
                               dma_state.method_count, opt_segment, effect);
             return;
@@ -830,7 +854,7 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     }
     auto& split = VideoCommon::GpuSplit::Get();
     if (split.Active()) {
-        split.WaitForWriters();
+        split.WaitForWriters(VideoCommon::DrainSite::ListWriters);
     }
     bool past_sync = !split.Active();
     using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;

@@ -360,7 +360,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             waiters.Remove(this);
         }
     } else {
-        DrainBack();
+        DrainBack(VideoCommon::GpuSplit::DrainSite::PullerAcquirePoll);
         do {
             const u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
             regs.acquire_source = true;
@@ -402,7 +402,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
-    DrainBack();
+    DrainBack(VideoCommon::GpuSplit::DrainSite::PullerAcquire);
     u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
     const auto value = regs.semaphore_acquire;
     while (word != value) {
@@ -438,7 +438,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         checks.fetch_add(1, std::memory_order_relaxed) >= 256) {
         return;
     }
-    DrainBack();
+    DrainBack(VideoCommon::DrainSite::FenceRelease);
     ReleaseFences(dma_pusher);
     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
     const bool ready = operation == 0   ? word == payload
