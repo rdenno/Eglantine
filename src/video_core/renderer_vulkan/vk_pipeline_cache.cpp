@@ -2113,7 +2113,7 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
     precache_workers.reset(new Common::ThreadWorker(threads, "VkShaderPrecache", {},
                                                     Common::ThreadPlacement::Background));
     for (auto& [key, env] : programs) {
-        precache_workers->QueueWork([this, key, env = std::move(env), write_marker]() mutable {
+        precache_workers->QueueWork([this, key, program_env = std::move(env), write_marker]() mutable {
             WaitForIdleRuntimeBuilds();
             if (precache_stop.load(std::memory_order_relaxed)) {
                 return;
@@ -2123,11 +2123,11 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
             if (state.compare_exchange_strong(expected, PrecacheState::Building)) {
                 try {
                     static const VideoCommon::GuessMissing guess{};
-                    env.SetGuessMissing(&guess);
+                    program_env.SetGuessMissing(&guess);
                     ShaderPools pools;
                     // Built and destroyed here, never bound: only the driver's cache keeps it.
                     const DriverBuildReport::PrecacheScope precache_scope;
-                    if (CreateComputePipeline(pools, key, env, nullptr, false).pipeline) {
+                    if (CreateComputePipeline(pools, key, program_env, nullptr, false).pipeline) {
                         precache_built.fetch_add(1, std::memory_order_relaxed);
                     }
                 } catch (const std::exception& e) {
