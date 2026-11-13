@@ -43,7 +43,8 @@ namespace {
 template <typename StopToken>
 void HoldForGpuLatency(const SubmitListCommand& list, const StopToken& stop_token) {
     const auto latency = Nx2GpuLatency::Latency();
-    if (latency.count() <= 0 || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+    if (latency.count() <= 0 || !Nx2GpuLatency::Steady() ||
+        !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
         return;
     }
     const auto until = list.submit_time + latency;
