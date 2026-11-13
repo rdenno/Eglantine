@@ -21,6 +21,7 @@
 #include "core/hle/service/nvdrv/devices/nvhost_ctrl.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_gpu_latency.h"
 
 namespace Service::Nvidia::Devices {
 
@@ -131,6 +132,8 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
 
     auto& host1x_syncpoint_manager = system.Host1x().GetSyncpointManager();
     const u32 target_value = params.fence.value;
+    // The game waits for GPU progress: lists held for nx2_gpu_latency.h can start.
+    VideoCommon::Nx2GpuLatency::NoteGuestWait();
 
     auto lock = NvEventsLock();
 
