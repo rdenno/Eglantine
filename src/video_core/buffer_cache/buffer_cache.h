@@ -526,6 +526,8 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         }
         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
             Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
+            Tegra::g_nx2_diag_kind = 1;
+            Tegra::g_nx2_diag_index = 0;
             Nx2NoteListWrite(buffer_b, pair.first, pair.second);
         }
     }
@@ -566,6 +568,8 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
     const BufferId buffer = FindBuffer(*cpu_dst_address, static_cast<u32>(size), false);
     Buffer& dest_buffer = slot_buffers[buffer];
     const u32 offset = dest_buffer.Offset(*cpu_dst_address);
+    Tegra::g_nx2_diag_kind = 2;
+    Tegra::g_nx2_diag_index = 0;
     runtime.ClearBuffer(dest_buffer, offset, size, value);
     dest_buffer.MarkUsage(offset, size);
     return true;
@@ -599,6 +603,9 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
 
     switch (post_op) {
     case ObtainBufferOperation::MarkAsWritten:
+        // DIAG (local only): kind 9 = ObtainCPUBuffer(MarkAsWritten)
+        Tegra::g_nx2_diag_kind = 9;
+        Tegra::g_nx2_diag_index = 0;
         MarkWrittenBuffer(buffer_id, device_addr, size);
         break;
     case ObtainBufferOperation::DiscardWrite: {
@@ -1954,6 +1961,8 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
             const u32 offset = buffer.Offset(segment.device_addr);
             buffer.MarkUsage(offset, segment.size);
             if (is_written) {
+                Tegra::g_nx2_diag_kind = 3;
+                Tegra::g_nx2_diag_index = 0;
                 MarkWrittenBuffer(segment.buffer_id, segment.device_addr, segment.size);
             }
             runtime.PushMultiRangeSource(buffer, offset, segment.size);
@@ -2008,6 +2017,8 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         }
 
         if (is_written) {
+            Tegra::g_nx2_diag_kind = 4;
+            Tegra::g_nx2_diag_index = (static_cast<u32>(stage) << 8) | index;
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
         }
 
@@ -2034,6 +2045,8 @@ void BufferCache<P>::BindHostGraphicsTextureBuffers(size_t stage) {
 
         const bool is_written = ((channel_state->written_texture_buffers[stage] >> index) & 1) != 0;
         if (is_written) {
+            Tegra::g_nx2_diag_kind = 5;
+            Tegra::g_nx2_diag_index = (static_cast<u32>(stage) << 8) | index;
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
         }
 
@@ -2072,6 +2085,8 @@ void BufferCache<P>::BindHostTransformFeedbackBuffers() {
             TouchBuffer(buffer, binding.buffer_id);
             size = binding.size;
             SynchronizeBuffer(buffer, binding.device_addr, size);
+            Tegra::g_nx2_diag_kind = 6;
+            Tegra::g_nx2_diag_index = index;
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
             offset = buffer.Offset(binding.device_addr);
             buffer.MarkUsage(offset, size);
@@ -2171,6 +2186,8 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         buffer.MarkUsage(offset, size);
 
         if (is_written) {
+            Tegra::g_nx2_diag_kind = 7;
+            Tegra::g_nx2_diag_index = index;
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size, true);
         }
 
@@ -2194,6 +2211,8 @@ void BufferCache<P>::BindHostComputeTextureBuffers() {
         const bool is_written =
             ((channel_state->written_compute_texture_buffers >> index) & 1) != 0;
         if (is_written) {
+            Tegra::g_nx2_diag_kind = 8;
+            Tegra::g_nx2_diag_index = index;
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
         }
 

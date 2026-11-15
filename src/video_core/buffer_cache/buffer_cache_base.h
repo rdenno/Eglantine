@@ -49,6 +49,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
@@ -483,6 +484,7 @@ public:
         return !nx2_list_copy_requests.empty();
     }
     void Nx2BeginWriterTrace(u64 shader) {
+        Tegra::g_nx2_diag_shader = shader;
         if (nx2_list_copy_demand) {
             nx2_list_copy_shader = shader;
         }
@@ -495,6 +497,7 @@ public:
         }
     }
     void Nx2EndWriterTrace() {
+        Tegra::g_nx2_diag_shader = 0;
         nx2_list_copy_shader = 0;
         if (nx2_buffer_deps) {
             nx2_buffer_deps->EndDispatch();

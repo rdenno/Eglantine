@@ -416,19 +416,30 @@ bool DmaPusher::Step() {
                                        std::chrono::steady_clock::now().time_since_epoch())
                                        .count();
                 std::vector<std::string> items;
-                for (u64 i = 0; i < scan_count && items.size() < 10; ++i) {
+                const Nx2DiagWrite* covering = nullptr;
+                for (u64 i = 0; i < scan_count; ++i) {
                     const auto& w = Tegra::g_nx2_diag_writes[(count - 1 - i) % 8192];
                     if (w.device_addr < page_end && w.device_addr + w.size > page_start) {
-                        const s64 off =
-                            static_cast<s64>(w.device_addr) - static_cast<s64>(*device);
-                        const int covers = (w.device_addr <= *device &&
-                                            w.device_addr + w.size >= *device + bytes)
-                                               ? 1
-                                               : 0;
-                        const s64 age_us = (now_ns - w.ns) / 1000;
-                        items.push_back(
-                            fmt::format("shader={:016x} off={} size={} covers={} age_us={}",
-                                        w.shader, off, w.size, covers, age_us));
+                        if (items.size() < 10) {
+                            const s64 off =
+                                static_cast<s64>(w.device_addr) - static_cast<s64>(*device);
+                            const int covers = (w.device_addr <= *device &&
+                                                w.device_addr + w.size >= *device + bytes)
+                                                   ? 1
+                                                   : 0;
+                            const s64 age_us = (now_ns - w.ns) / 1000;
+                            items.push_back(fmt::format(
+                                "shader={:016x} kind={} idx={:#x} off={} size={} covers={} "
+                                "age_us={}",
+                                w.shader, w.kind, w.index, off, w.size, covers, age_us));
+                        }
+                    }
+                    if (!covering && w.device_addr <= *device &&
+                        w.device_addr + w.size >= *device + bytes) {
+                        covering = &w;
+                    }
+                    if (items.size() >= 10 && covering != nullptr) {
+                        break;
                     }
                 }
                 const std::string writers =
@@ -436,6 +447,26 @@ bool DmaPusher::Step() {
                 LOG_ERROR(HW_GPU,
                           "DIAG writers: entry {:#x} device {:#x} page writes newest first: {}",
                           addr, *device, writers);
+                if (covering != nullptr) {
+                    // DIAG (local only): block contents for the newest covering write.
+                    std::array<u32, 12> head{};
+                    std::array<u32, 12> tail{};
+                    const s64 off =
+                        static_cast<s64>(covering->device_addr) - static_cast<s64>(*device);
+                    const GPUVAddr head_addr = addr + off;
+                    const GPUVAddr tail_addr =
+                        addr + (static_cast<s64>(covering->device_addr + covering->size - 48) -
+                                static_cast<s64>(*device));
+                    memory_manager.ReadBlockUnsafe(head_addr, head.data(),
+                                                   head.size() * sizeof(u32));
+                    memory_manager.ReadBlockUnsafe(tail_addr, tail.data(),
+                                                   tail.size() * sizeof(u32));
+                    LOG_ERROR(HW_GPU,
+                              "DIAG block: entry {:#x} range start {} size {} head: {:08x} tail: "
+                              "{:08x}",
+                              addr, off, covering->size, fmt::join(head, " "),
+                              fmt::join(tail, " "));
+                }
             }
         };
         // DIAG (local only): candidate fix behind an environment variable.

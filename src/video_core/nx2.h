@@ -86,16 +86,22 @@ struct Nx2DiagWrite {
     u64 size;
     u64 shader;
     s64 ns;
+    u32 kind;
+    u32 index;
 };
 inline std::array<Nx2DiagWrite, 8192> g_nx2_diag_writes{};
 inline std::atomic<u64> g_nx2_diag_write_count{0};
+inline thread_local u32 g_nx2_diag_kind = 0;
+inline thread_local u32 g_nx2_diag_index = 0;
+inline thread_local u64 g_nx2_diag_shader = 0;
 
 inline void Nx2DiagNoteWrite(u64 device_addr, u64 size, u64 shader) {
     const s64 ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                        std::chrono::steady_clock::now().time_since_epoch())
                        .count();
+    const u64 write_shader = shader != 0 ? shader : g_nx2_diag_shader;
     g_nx2_diag_writes[g_nx2_diag_write_count.fetch_add(1) % 8192] = {
-        device_addr, size, shader, ns};
+        device_addr, size, write_shader, ns, g_nx2_diag_kind, g_nx2_diag_index};
 }
 
 // Shaders in graphics pipeline stages that write storage buffers or command list pages.
