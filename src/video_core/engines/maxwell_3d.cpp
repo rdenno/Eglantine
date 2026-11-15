@@ -2476,6 +2476,16 @@ bool Maxwell3D::FrontDmaReadEarly(VideoCommon::GpuSplit& split, FrontState& fs, 
                           "{:#x} without the drain, {:#x} after it",
                           skipped_draws ? "macro_read_writer_set" : "split", macro, words, source,
                           i, read[i], drained);
+                // DIAG (local only): why the early read missed it.
+                LOG_ERROR(HW_GPU,
+                          "DIAG early read miss: page {:#x} gpu_written_after_drain={} region={} "
+                          "buffer_dirty={} target={} consumed_at_read={} consumed_now={} "
+                          "write_target={} last_unknown={} last_gpu={} async={}",
+                          pages[0], Tegra::Nx2IsGpuWritten(pages[0]),
+                          Tegra::Nx2IsGpuWrittenRegion(pages[0]), verify_flush_buffers, target,
+                          consumed, consumed_now, write_target, split.Writes().LastUnknown(),
+                          split.Writes().LastGpu(),
+                          split.HasAsyncWrite(read_ranges[0].first, read_ranges[0].second));
             }
         }
         read[i] = drained;
