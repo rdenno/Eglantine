@@ -362,15 +362,93 @@ bool DmaPusher::Step() {
             split.Drain(VideoCommon::DrainSite::ListFlush);
             flush_read(dirty2, late);
             const bool bit_after = device && Nx2IsGpuWritten(*device);
+            const bool has_snap =
+                dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
+                size_t{command_list.submitted_offsets[dma_pushbuffer_subindex]} + header.size <=
+                    command_list.submitted_words.size();
+            std::array<u32, 8> snap{};
+            if (has_snap) {
+                const u32 offset = command_list.submitted_offsets[dma_pushbuffer_subindex];
+                for (size_t i = 0; i < header.size; ++i) {
+                    snap[i] = command_list.submitted_words[offset + i].argument;
+                }
+            }
+            const double age_ms =
+                command_list.diag_submit_ns != 0
+                    ? static_cast<double>(
+                          std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count() -
+                          command_list.diag_submit_ns) /
+                          1e6
+                    : -1.0;
+            const std::string snap_str =
+                has_snap ? fmt::format("{:08x}",
+                                       fmt::join(std::span{snap}.first(size_t{header.size}), " "))
+                         : "none";
             LOG_ERROR(HW_GPU,
                       "DIAG bad macro payload: macro method {:#x} ({} left) entry {:#x}+{} (device {:#x}) "
                       "path={} gpu_written_at_choice={} bit_now={} bit_after={} list_page={} "
-                      "got={:08x} dirty1={} flushed={:08x} dirty2={} late30ms={:08x}",
+                      "got={:08x} dirty1={} flushed={:08x} dirty2={} late30ms={:08x} "
+                      "snap={} age_ms={:.1f} entry_index={} of {}",
                       dma_state.method, dma_state.method_count, addr, header.size, device.value_or(0),
                       path, diag_gpu_written, bit_now, bit_after, list_page,
                       fmt::join(std::span{got}.first(size_t{header.size}), " "), dirty1,
                       fmt::join(std::span{flushed}.first(size_t{header.size}), " "), dirty2,
-                      fmt::join(std::span{late}.first(size_t{header.size}), " "));
+                      fmt::join(std::span{late}.first(size_t{header.size}), " "),
+                      snap_str, age_ms, dma_pushbuffer_subindex,
+                      command_list.command_lists.size());
+        };
+        // DIAG (local only): candidate fix behind an environment variable.
+        static const bool diag_snapshot_args = [] {
+            const char* val = std::getenv("EDEN_DIAG_SNAPSHOT_ARGS");
+            return val != nullptr && val[0] == '1';
+        }();
+        const auto diag_pick = [&](std::span<const CommandHeader> live)
+            -> std::span<const CommandHeader> {
+            if (!diag_snapshot_args || !diag_macro_payload) {
+                return live;
+            }
+            const bool has_snap =
+                dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
+                size_t{command_list.submitted_offsets[dma_pushbuffer_subindex]} + header.size <=
+                    command_list.submitted_words.size();
+            if (!has_snap) {
+                return live;
+            }
+            const u32 offset = command_list.submitted_offsets[dma_pushbuffer_subindex];
+            const CommandHeader* const copy_data =
+                command_list.submitted_words.data() + offset;
+            const size_t check_words = std::min<size_t>(dma_state.method_count, header.size);
+            bool live_bad = false;
+            for (size_t i = 0; i < check_words; ++i) {
+                if (live[i].argument > 0x00ffffffU) {
+                    live_bad = true;
+                    break;
+                }
+            }
+            if (!live_bad) {
+                return live;
+            }
+            for (size_t i = 0; i < check_words; ++i) {
+                if (copy_data[i].argument > 0x00ffffffU) {
+                    return live;
+                }
+            }
+            static std::atomic<u32> diag_snap_used{};
+            if (diag_snap_used.fetch_add(1) < 40) {
+                std::array<u32, 8> live_words{}, snap_words{};
+                for (size_t i = 0; i < header.size; ++i) {
+                    live_words[i] = live[i].argument;
+                    snap_words[i] = copy_data[i].argument;
+                }
+                LOG_ERROR(HW_GPU,
+                          "DIAG snapshot args used: entry {:#x}+{} live={:08x} snap={:08x}",
+                          dma_state.dma_get, header.size,
+                          fmt::join(std::span{live_words}.first(size_t{header.size}), " "),
+                          fmt::join(std::span{snap_words}.first(size_t{header.size}), " "));
+            }
+            return std::span<const CommandHeader>{copy_data, header.size};
         };
         if (submitted) {
             const std::span<const CommandHeader> commands{
@@ -391,16 +469,18 @@ bool DmaPusher::Step() {
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
-            const std::span<const CommandHeader> commands{command_headers.data(), header.size};
-            diag_check(commands, "gpu-written list");
+            const std::span<const CommandHeader> live{command_headers.data(), header.size};
+            const auto commands = diag_pick(live);
+            diag_check(live, "gpu-written list");
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
             FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
-            const std::span<const CommandHeader> commands{headers.data(), headers.size()};
-            diag_check(commands, "flush");
+            const std::span<const CommandHeader> live{headers.data(), headers.size()};
+            const auto commands = diag_pick(live);
+            diag_check(live, "flush");
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);

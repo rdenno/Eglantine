@@ -137,6 +137,8 @@ struct CommandList final {
     /// that waited behind one, reads memory instead: games write the commands it runs before they
     /// release the acquire.
     u64 snapshot_suspensions = 0;
+    /// DIAG (local only): steady_clock nanoseconds when the list was submitted.
+    s64 diag_submit_ns = 0;
 };
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
