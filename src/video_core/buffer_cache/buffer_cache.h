@@ -1253,7 +1253,9 @@ void BufferCache<P>::ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> range
 template <class P>
 Common::RangeSet<DAddr> BufferCache<P>::PendingCpuWriteRanges() {
     Common::RangeSet<DAddr> ranges;
-    if (pending_cpu_writes) {
+    // DIAG (local only): EDEN_DIAG_NO_CPU_GUARD=1 lets downloads write over pending CPU writes.
+    static const bool no_guard = std::getenv("EDEN_DIAG_NO_CPU_GUARD") != nullptr;
+    if (pending_cpu_writes && !no_guard) {
         pending_cpu_writes(
             [&ranges](DAddr device_addr, size_t size) { ranges.Add(device_addr, size); });
     }
@@ -1269,7 +1271,13 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
     }
     Common::RangeSet<DAddr> parts;
     parts.Add(device_addr, size);
-    cpu_written.ForEachInRange(device_addr, size, [&parts](DAddr start, DAddr end) {
+    cpu_written.ForEachInRange(device_addr, size, [&parts, device_addr, size](DAddr start, DAddr end) {
+        // DIAG (local only): a download that leaves pending CPU bytes in place.
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 400) {
+            LOG_WARNING(HW_GPU, "DIAG download keeps pending CPU write [{:#x}, {:#x}) inside download [{:#x}, +{:#x})",
+                        start, end, device_addr, size);
+        }
         parts.Subtract(start, end - start);
     });
     parts.ForEach([&](DAddr start, DAddr end) {
