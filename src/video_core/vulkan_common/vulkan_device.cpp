@@ -16,6 +16,7 @@
 #include <fstream>
 #include <optional>
 #include <thread>
+#include <tuple>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <utility>
@@ -1410,12 +1411,17 @@ bool Device::GetSuitability(bool requires_swapchain) {
     }
 
     // Intel Windows < 27.20.100.0: Broken VertexInputDynamicState
-    // Same for NVIDIA Proprietary < 580.119.02, unknown when VIDS was first NOT broken
+    // Same for NVIDIA Proprietary < 580.119.02 (10-8-8-6 encoding)
     // Disable VertexInputDynamicState on old Intel Windows drivers
     if (extensions.vertex_input_dynamic_state) {
         const u32 version = (properties.properties.driverVersion << 3) >> 3;
-        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && version < VK_MAKE_API_VERSION(27, 20, 100, 0))
-        || (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && version < VK_MAKE_API_VERSION(580, 119, 02, 0))) {
+        const u32 nv_major = properties.properties.driverVersion >> 22;
+        const u32 nv_minor = (properties.properties.driverVersion >> 14) & 0xff;
+        const u32 nv_patch = (properties.properties.driverVersion >> 6) & 0xff;
+        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS &&
+             version < VK_MAKE_API_VERSION(27, 20, 100, 0)) ||
+            (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+             std::tuple(nv_major, nv_minor, nv_patch) < std::tuple(580u, 119u, 2u))) {
             LOG_WARNING(Render_Vulkan, "Disabling broken VK_EXT_vertex_input_dynamic_state");
             RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
         }
