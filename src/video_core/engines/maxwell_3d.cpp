@@ -15,6 +15,9 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <thread>
+#include <span>
+
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -2286,6 +2289,44 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         const size_t old_size = fs.parameters.size();
         fs.parameters.resize(old_size + words);
         memory_manager.ReadWordsUnsafe(source, fs.parameters.data() + old_size, words);
+        // DIAG (local only): implausible draw parameters (heap leftovers such as floats).
+        const u32* const got = fs.parameters.data() + old_size;
+        bool implausible = false;
+        for (u32 i = 0; i < words && i < 8; ++i) {
+            implausible |= got[i] > 0x00ffffffU;
+        }
+        static std::atomic<u32> diag_logged{};
+        if (implausible && words <= 8 && diag_logged.fetch_add(1) < 200) {
+            const auto device = memory_manager.GpuToCpuAddress(source);
+            std::array<u32, 8> first{}, second{}, third{};
+            std::copy_n(got, (std::min<u32>)(words, 8), first.begin());
+            const bool dirty_after = memory_manager.IsMemoryDirty(source, read_bytes,
+                                                                  VideoCommon::CacheType::BufferCache);
+            split.Run([memory = &memory_manager, source, read_bytes] {
+                memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+                memory->FlushQueryResults(source, read_bytes);
+            }, VideoCommon::DrainSite::MacroDmaFlush);
+            memory_manager.ReadWordsUnsafe(source, second.data(), (std::min<u32>)(words, 8));
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+            const bool dirty_late = memory_manager.IsMemoryDirty(source, read_bytes,
+                                                                 VideoCommon::CacheType::BufferCache);
+            split.Run([memory = &memory_manager, source, read_bytes] {
+                memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+                memory->FlushQueryResults(source, read_bytes);
+            }, VideoCommon::DrainSite::MacroDmaFlush);
+            memory_manager.ReadWordsUnsafe(source, third.data(), (std::min<u32>)(words, 8));
+            LOG_ERROR(HW_GPU,
+                      "DIAG bad MME params macro {:#x} at {:#x} (device {:#x}) words {}: dirty_before={} "
+                      "dirty_after={} gpu_written={} region={} first={:08x} second={:08x} "
+                      "dirty_late={} third(30ms)={:08x}",
+                      macro, source, device.value_or(0), words, flush_buffers, dirty_after,
+                      device ? Tegra::Nx2IsGpuWritten(*device) : false,
+                      device ? Tegra::Nx2IsGpuWrittenRegion(*device) : false,
+                      fmt::join(std::span{first}.first((std::min<u32>)(words, 8)), " "),
+                      fmt::join(std::span{second}.first((std::min<u32>)(words, 8)), " "), dirty_late,
+                      fmt::join(std::span{third}.first((std::min<u32>)(words, 8)), " "));
+        }
     } else if (ram < native_data_ram.size()) {
         const size_t copy_words = (std::min<size_t>)(words, native_data_ram.size() - ram);
         memory_manager.ReadWordsUnsafe(source, native_data_ram.data() + ram, copy_words);
