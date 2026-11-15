@@ -398,6 +398,45 @@ bool DmaPusher::Step() {
                       fmt::join(std::span{late}.first(size_t{header.size}), " "),
                       snap_str, age_ms, dma_pushbuffer_subindex,
                       command_list.command_lists.size());
+            if (device) {
+                // DIAG (local only): context dump around the entry.
+                std::array<u32, 28> ctx_words{};
+                memory_manager.ReadBlockUnsafe(addr - 0x30, ctx_words.data(),
+                                               ctx_words.size() * sizeof(u32));
+                const std::string words =
+                    fmt::format("{:08x}", fmt::join(ctx_words, " "));
+                LOG_ERROR(HW_GPU, "DIAG ctx: entry {:#x} words from -0x30: {}", addr, words);
+
+                // DIAG (local only): recent writes to the entry's page.
+                const u64 page_start = *device & ~0xfffULL;
+                const u64 page_end = page_start + 4096;
+                const u64 count = Tegra::g_nx2_diag_write_count.load();
+                const u64 scan_count = std::min<u64>(count, 8192);
+                const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count();
+                std::vector<std::string> items;
+                for (u64 i = 0; i < scan_count && items.size() < 10; ++i) {
+                    const auto& w = Tegra::g_nx2_diag_writes[(count - 1 - i) % 8192];
+                    if (w.device_addr < page_end && w.device_addr + w.size > page_start) {
+                        const s64 off =
+                            static_cast<s64>(w.device_addr) - static_cast<s64>(*device);
+                        const int covers = (w.device_addr <= *device &&
+                                            w.device_addr + w.size >= *device + bytes)
+                                               ? 1
+                                               : 0;
+                        const s64 age_us = (now_ns - w.ns) / 1000;
+                        items.push_back(
+                            fmt::format("shader={:016x} off={} size={} covers={} age_us={}",
+                                        w.shader, off, w.size, covers, age_us));
+                    }
+                }
+                const std::string writers =
+                    items.empty() ? "none" : fmt::format("{}", fmt::join(items, " ; "));
+                LOG_ERROR(HW_GPU,
+                          "DIAG writers: entry {:#x} device {:#x} page writes newest first: {}",
+                          addr, *device, writers);
+            }
         };
         // DIAG (local only): candidate fix behind an environment variable.
         static const bool diag_snapshot_args = [] {

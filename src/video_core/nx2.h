@@ -80,6 +80,24 @@ inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
 inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_command_list_pages{};
 inline std::atomic<bool> g_nx2_has_command_list_pages{false};
 
+// DIAG (local only): ring of recent GPU writes to command list pages.
+struct Nx2DiagWrite {
+    u64 device_addr;
+    u64 size;
+    u64 shader;
+    s64 ns;
+};
+inline std::array<Nx2DiagWrite, 8192> g_nx2_diag_writes{};
+inline std::atomic<u64> g_nx2_diag_write_count{0};
+
+inline void Nx2DiagNoteWrite(u64 device_addr, u64 size, u64 shader) {
+    const s64 ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count();
+    g_nx2_diag_writes[g_nx2_diag_write_count.fetch_add(1) % 8192] = {
+        device_addr, size, shader, ns};
+}
+
 // Shaders in graphics pipeline stages that write storage buffers or command list pages.
 // Checked on the split GPU thread's front to identify writer draws and note them with split.NoteWriter().
 // Sized to 65,536 bits (1,024 64-bit words, 8 KiB), indexed via a fast multiplicative hash of the

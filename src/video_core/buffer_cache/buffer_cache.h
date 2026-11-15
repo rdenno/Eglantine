@@ -2601,6 +2601,7 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
         constexpr u64 page_bits = Tegra::Nx2WrittenPageBits;
         const u64 last = (std::min<u64>)((device_addr + size - 1) >> page_bits,
                                          Tegra::g_nx2_command_list_pages.size() * 64 - 1);
+        bool noted = false;
         for (u64 page = device_addr >> page_bits; page <= last;) {
             // Storage buffers can be large: skip 64 pages at a time where none is a list page.
             const u64 word =
@@ -2611,6 +2612,10 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
                 continue;
             }
             if (word & 1) {
+                if (!noted) {
+                    Tegra::Nx2DiagNoteWrite(device_addr, size, nx2_list_copy_shader);
+                    noted = true;
+                }
                 const DAddr page_addr = page << page_bits;
                 {
                     std::scoped_lock lock{nx2_list_mutex};
