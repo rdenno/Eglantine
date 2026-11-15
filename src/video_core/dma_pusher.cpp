@@ -13,6 +13,10 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <array>
+#include <chrono>
+#include <span>
+#include <thread>
 
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -313,11 +317,67 @@ bool DmaPusher::Step() {
                 }
             }
         }
+        // DIAG (local only): bad macro parameters from a small entry.
+        const bool diag_macro_payload =
+            g_nx2_ampere.load(std::memory_order_relaxed) && command_resume_offset == 0 &&
+            header.size <= 8 && subchannels[dma_state.subchannel] && dma_state.method_count != 0 &&
+            subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D &&
+            dma_state.method >= MacroRegistersStart;
+        const bool diag_gpu_written = gpu_written;
+        const auto diag_check = [&](std::span<const CommandHeader> cmds, const char* path) {
+            if (!diag_macro_payload) {
+                return;
+            }
+            const size_t n = (std::min<size_t>)(dma_state.method_count, cmds.size());
+            bool bad = false;
+            for (size_t i = 0; i < n; ++i) {
+                bad |= cmds[i].argument > 0x00ffffffU;
+            }
+            static std::atomic<u32> diag_logged{};
+            if (!bad || diag_logged.fetch_add(1) >= 200) {
+                return;
+            }
+            std::array<u32, 8> got{}, flushed{}, late{};
+            for (size_t i = 0; i < cmds.size(); ++i) {
+                got[i] = cmds[i].argument;
+            }
+            const GPUVAddr addr = dma_state.dma_get;
+            const size_t bytes = size_t{header.size} * sizeof(u32);
+            const auto device = memory_manager.GpuToCpuAddress(addr);
+            const bool bit_now = device && Nx2IsGpuWritten(*device);
+            const bool list_page = device && Nx2IsCommandListPage(*device);
+            auto& split = VideoCommon::GpuSplit::Get();
+            bool dirty1 = false, dirty2 = false;
+            const auto flush_read = [&](bool& dirty, std::array<u32, 8>& out) {
+                Tegra::MemoryManager* const memory = &memory_manager;
+                bool* const dirty_out = &dirty;
+                split.Run([memory, addr, bytes, dirty_out] {
+                    *dirty_out = memory->IsMemoryDirty(addr, bytes, VideoCommon::CacheType::BufferCache);
+                    memory->FlushRegion(addr, bytes, VideoCommon::CacheType::BufferCache);
+                }, VideoCommon::DrainSite::ListFlush);
+                memory_manager.ReadBlockUnsafe(addr, out.data(), bytes);
+            };
+            flush_read(dirty1, flushed);
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            split.Drain(VideoCommon::DrainSite::ListFlush);
+            flush_read(dirty2, late);
+            const bool bit_after = device && Nx2IsGpuWritten(*device);
+            LOG_ERROR(HW_GPU,
+                      "DIAG bad macro payload: macro method {:#x} ({} left) entry {:#x}+{} (device {:#x}) "
+                      "path={} gpu_written_at_choice={} bit_now={} bit_after={} list_page={} "
+                      "got={:08x} dirty1={} flushed={:08x} dirty2={} late30ms={:08x}",
+                      dma_state.method, dma_state.method_count, addr, header.size, device.value_or(0),
+                      path, diag_gpu_written, bit_now, bit_after, list_page,
+                      fmt::join(std::span{got}.first(size_t{header.size}), " "), dirty1,
+                      fmt::join(std::span{flushed}.first(size_t{header.size}), " "), dirty2,
+                      fmt::join(std::span{late}.first(size_t{header.size}), " "));
+        };
         if (submitted) {
             const std::span<const CommandHeader> commands{
                 command_list.submitted_words.data() +
                     command_list.submitted_offsets[dma_pushbuffer_subindex],
                 header.size};
+            diag_check(commands, "submitted");
             if (command_resume_offset == 0) {
                 RecordParsedEntry(header, commands);
             }
@@ -326,11 +386,13 @@ bool DmaPusher::Step() {
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
+            diag_check(commands, "safe");
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
+            diag_check(commands, "gpu-written list");
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
@@ -338,6 +400,7 @@ bool DmaPusher::Step() {
             FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
+            diag_check(commands, "flush");
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
