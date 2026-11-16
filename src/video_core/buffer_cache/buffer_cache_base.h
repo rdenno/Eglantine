@@ -1115,6 +1115,12 @@ private:
         u64 demand_skipped{}, demand_promoted{};
     } nx2_list_copy_stats; ///< Protected by nx2_list_mutex.
     std::unordered_map<DAddr, Nx2ListPage> nx2_list_pages;
+    // DIAG (local only): shadow copy of compute uniform banks for untracked CPU write detection.
+    struct Nx2DiagComputeBankShadow {
+        std::vector<u8> bytes;
+        std::vector<bool> initialized;
+    };
+    std::unordered_map<DAddr, Nx2DiagComputeBankShadow> nx2_diag_compute_bank_shadow;
     /// Copies replaced while the GPU may still write them: freed once it is past their tick.
     std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
     boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+﻿// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
@@ -2151,6 +2151,71 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
                     device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
                 }
                 return;
+            }
+        }
+
+        // DIAG (local only): detect untracked CPU writes to compute uniform banks.
+        if (has_host_buffer && size != 0 && gpu_memory != nullptr &&
+            gpu_memory->UsesNativeTiling() &&
+            !memory_tracker.IsRegionGpuModified(binding.device_addr, size)) {
+            static const bool diag_fix = [] {
+                const char* const env = std::getenv("EDEN_DIAG_COMPUTE_BANK");
+                return env != nullptr && env[0] == '1';
+            }();
+            static const bool diag_off = [] {
+                const char* const env = std::getenv("EDEN_DIAG_COMPUTE_BANK");
+                return env != nullptr && env[0] == '0';
+            }();
+            if (!diag_off) {
+                Nx2DiagComputeBankShadow& shadow =
+                    nx2_diag_compute_bank_shadow[binding.device_addr];
+                const size_t num_chunks = (std::max)(
+                    static_cast<size_t>(Common::DivCeil(size, Core::DEVICE_PAGESIZE)),
+                    static_cast<size_t>(((binding.device_addr + size - 1) >>
+                                         Core::DEVICE_PAGEBITS) -
+                                        (binding.device_addr >> Core::DEVICE_PAGEBITS) + 1));
+                if (shadow.bytes.size() < size) {
+                    shadow.bytes.resize(size);
+                }
+                if (shadow.initialized.size() < num_chunks) {
+                    shadow.initialized.resize(num_chunks);
+                }
+                u32 bank_offset = 0;
+                u32 chunk_num = 0;
+                while (bank_offset < size) {
+                    const DAddr cur_addr = binding.device_addr + bank_offset;
+                    const u64 page_offset = cur_addr & Core::DEVICE_PAGEMASK;
+                    const u32 remaining = size - bank_offset;
+                    const u32 chunk_size = static_cast<u32>(
+                        (std::min<u64>)(Core::DEVICE_PAGESIZE - page_offset, remaining));
+                    const u8* const ptr = device_memory.template GetPointer<u8>(cur_addr);
+                    if (ptr == nullptr) {
+                        break;
+                    }
+                    const bool tracked =
+                        memory_tracker.IsRegionCpuModified(cur_addr, chunk_size);
+                    const u8* const shadow_ptr = shadow.bytes.data() + bank_offset;
+                    if (shadow.initialized[chunk_num] && !tracked &&
+                        std::memcmp(shadow_ptr, ptr, chunk_size) != 0) {
+                        static std::atomic<u64> counter{0};
+                        const u64 count = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (count <= 80 || (count % 1000) == 0) {
+                            LOG_ERROR(HW_GPU,
+                                      "DIAG compute bank untracked change: bank {:x} slot {} "
+                                      "chunk {} size {} shader {:016x} fix {} total {}",
+                                      binding.device_addr, index, chunk_num, size,
+                                      Tegra::g_nx2_diag_shader, diag_fix ? 1 : 0, count);
+                        }
+                        if (diag_fix) {
+                            memory_tracker.MarkRegionAsCpuModified(cur_addr, chunk_size);
+                            last_synced_count = 0;
+                        }
+                    }
+                    std::memcpy(shadow.bytes.data() + bank_offset, ptr, chunk_size);
+                    shadow.initialized[chunk_num] = true;
+                    bank_offset += chunk_size;
+                    ++chunk_num;
+                }
             }
         }
 
