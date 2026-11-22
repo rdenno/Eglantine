@@ -171,7 +171,7 @@ jobs:
           flags=(
             -DCMAKE_BUILD_TYPE=Release
             -DBUILD_TESTING=OFF
-            -DYUZU_TESTS=OFF
+            -DYUZU_TESTS=ON
             -DYUZU_CMD=ON
             -DYUZU_ROOM=OFF
             -DYUZU_ROOM_STANDALONE=OFF
@@ -215,8 +215,9 @@ jobs:
         shell: bash
         run: |
           ccache --zero-stats
-          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          cmake --build build/release --target yuzu yuzu-cmd tests --parallel
           ccache --show-stats -vv
+          build/release/bin/tests "[native_image_matching]"
 
       # Plain tar.gz with the two programs. GitHub artifacts drop the executable bit, so a tar is
       # what keeps it. This one is not self-contained: it needs Qt 6 and the usual libraries
