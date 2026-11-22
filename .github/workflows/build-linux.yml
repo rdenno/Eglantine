@@ -1,7 +1,8 @@
 name: build-linux
 
-# Reusable: builds the Linux binaries (x86_64 and aarch64; with pgo=both also the clang PGO
-# variants) and uploads one artifact per platform holding the tar.gz and the AppImage.
+# Reusable: builds the Linux binaries (x86_64 and aarch64, or the arch input's subset;
+# with pgo=both also the clang PGO variants) and uploads one artifact per platform
+# holding the tar.gz and the AppImage.
 on:
   workflow_call:
     inputs:
@@ -11,6 +12,14 @@ on:
       version:
         type: string
         required: true
+      display:
+        description: Human-facing build identity (plain variant)
+        type: string
+        default: ""
+      display_pgo:
+        description: Human-facing build identity (PGO variant)
+        type: string
+        default: ""
       refspec:
         type: string
         required: true
@@ -23,10 +32,18 @@ on:
       nightly:
         type: boolean
         default: true
+      arch:
+        description: Architectures to build (both, x86_64 or aarch64)
+        type: string
+        default: both
       pgo:
         description: none or both
         type: string
         default: none
+      save_cache:
+        description: Force-save the compiler and CPM caches at the end of the job
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -42,15 +59,14 @@ jobs:
     name: linux-${{ matrix.arch }}${{ matrix.pgo && '-pgo' || '' }}
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     env:
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
-      CCACHE_MAXSIZE: 1000M
       PLATFORM: linux-${{ matrix.arch }}${{ matrix.pgo && '-pgo' || '' }}
       SHA: ${{ inputs.sha }}
+
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
-        pgo: ${{ fromJSON(inputs.pgo == 'both' && '[false, true]' || '[false]') }}
+        arch: ${{ fromJSON(inputs.arch == 'aarch64' && '["aarch64"]' || (inputs.arch == 'x86_64' && '["x86_64"]' || '["x86_64","aarch64"]')) }}
+        pgo: ${{ fromJSON(inputs.pgo == 'only' && '[true]' || (inputs.pgo == 'both' && '[false, true]' || '[false]')) }}
 
     steps:
       - name: Check out source
@@ -68,6 +84,8 @@ jobs:
           refspec: ${{ inputs.refspec }}
           tag: ${{ inputs.tag }}
           release: ${{ inputs.release }}
+          save-cache: ${{ inputs.save_cache }}
+          display: ${{ matrix.pgo && inputs.display_pgo || inputs.display }}
 
       - name: Setup build from compatibility pin
         if: hashFiles('.github/actions/setup-build/action.yml') == ''
@@ -78,25 +96,18 @@ jobs:
           refspec: ${{ inputs.refspec }}
           tag: ${{ inputs.tag }}
           release: ${{ inputs.release }}
-
-      - name: Cache APT packages
-        uses: actions/cache@v6
-        with:
-          path: /var/cache/apt/archives
-          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/*.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-apt-
+          save-cache: ${{ inputs.save_cache }}
 
       - name: Install Linux dependencies
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            autoconf cmake g++ gcc git glslang-tools libglu1-mesa-dev \
+            sudo autoconf cmake g++ gcc git glslang-tools libglu1-mesa-dev \
             libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
             mesa-common-dev nasm ninja-build qt6-base-private-dev \
-            qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev \
-            libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
+            qt6-charts-dev qt6-tools-dev libdrm-dev libx11-dev \
+            pkg-config zlib1g-dev libva-dev libvdpau-dev \
             spirv-tools spirv-headers libusb-1.0-0-dev \
             libboost-dev libboost-fiber-dev libboost-context-dev \
             libopus-dev libasound2-dev ccache \
@@ -125,7 +136,6 @@ jobs:
           modules: qtcharts
           cache: true
 
-      # TODO: Move to ubuntu 26 which has llvm-23 by default
       # Ubuntu's own clang 18 cannot read a profile from a current LLVM, so take clang from the LLVM
       # apt repo. The versioned packages are named explicitly: that repo's unversioned clang/lld
       # metapackages can lag the binaries they depend on and then resolve to nothing. lld-23 only
@@ -135,9 +145,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          codename=$(lsb_release -cs)
+
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
             sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-$PGO_LLVM_VERSION main" |
+          echo "deb http://apt.llvm.org/$codename/ llvm-toolchain-$codename-$PGO_LLVM_VERSION main" |
             sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -166,10 +178,15 @@ jobs:
             -DYUZU_USE_BUNDLED_QT=OFF
             "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR"
             -DYUZU_USE_BUNDLED_SDL3=ON
+            -DYUZU_USE_BUNDLED_OPENSSL=ON
+            -DYUZU_USE_BUNDLED_FFMPEG=ON
             -DVulkanHeaders_FORCE_BUNDLED=ON
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
-            -DENABLE_UPDATE_CHECKER=OFF
-            -DUSE_DISCORD_PRESENCE=OFF
+            -DENABLE_QT_TRANSLATION=ON
+            -DENABLE_UPDATE_CHECKER=${{ (inputs.release || startsWith(inputs.tag, 'daily-')) && 'ON' || 'OFF' }}
+            -DEGLANTINE_UPDATE_REPO=${{ github.repository }}
+            -DEGLANTINE_RELEASE_PLATFORM=${{ env.PLATFORM }}
+            -DUSE_DISCORD_PRESENCE=ON
             -DUSE_CCACHE=ON
             -DNIGHTLY_BUILD=${{ inputs.nightly && 'ON' || 'OFF' }}
           )
@@ -187,11 +204,19 @@ jobs:
           fi
           cmake -S . -B build/release -G Ninja "${flags[@]}"
 
+      - name: ccache settings
+        shell: bash
+        run: |
+          ccache --version | head -1
+          ccache -p | grep -vE '^#' | grep -E '(cache_dir|compiler_check|base_dir|hash_dir|sloppiness|max_size|umask)' || true
+          if [ '${{ matrix.pgo }}' = 'true' ]; then clang-$PGO_LLVM_VERSION --version | head -1; fi
+
       - name: Build
         shell: bash
         run: |
+          ccache --zero-stats
           cmake --build build/release --target yuzu yuzu-cmd --parallel
-          ccache --show-stats
+          ccache --show-stats -vv
 
       # Plain tar.gz with the two programs. GitHub artifacts drop the executable bit, so a tar is
       # what keeps it. This one is not self-contained: it needs Qt 6 and the usual libraries
@@ -242,7 +267,7 @@ jobs:
           "$tools/linuxdeploy-$arch.AppImage" --appdir AppDir \
             --executable build/release/bin/eglantine \
             --executable build/release/bin/eden-cli \
-            --desktop-file dist/dev.eden_emu.eden.desktop \
+            --desktop-file dist/dev.eglantine.eglantine.desktop \
             --icon-file "$icon" \
             --plugin qt \
             --output appimage
@@ -260,3 +285,10 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ccache-debug-${{ env.PLATFORM }}
+          path: ccache-debug
+          retention-days: 2

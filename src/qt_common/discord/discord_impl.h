@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -29,6 +32,7 @@ private:
     void UpdateGameStatus(std::string_view game_url, bool use_default);
 
     std::string game_title{};
+    std::string game_version{};
     Core::System& system;
 };
 

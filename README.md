@@ -15,7 +15,7 @@
   <br>
 </h1>
 
-<h4 align="center"><b>Eglantine</b> is a free and opensource (FOSS) Switch 2 emulator, derived from Eden, Yuzu and Sudachi - started by developer Camille LaVey.
+<h4 align="center"><b>Eglantine</b> is a free and opensource (FOSS) Switch 2 emulator, derived from Eden, Yuzu and Sudachi - started by developer Djihad Mahboubi.
 It's written in C++ with portability in mind, with builds for Windows, Linux and macOS
 </h4>
 
@@ -39,7 +39,7 @@ It's written in C++ with portability in mind, with builds for Windows, Linux and
 
 ## Compatibility
 
-The emulator is capable of running Mario Kart World at decent/full speed depending on specs and configurations, and Splatoon Raiders at variable performances
+The emulator is capable of running Mario Kart World at full speed on most specs, Splatoon Raiders and OOT also run fine.
 
 A list of supported games will be available in future. Please be patient.
 
@@ -65,20 +65,23 @@ You can download the latest releases from [here](https://github.com/Djihads80/Eg
 
 ## Support
 
-We currently do not take in any donations for the time being
+We currently take donations on [Open Collective](https://opencollective.com/eglantine-community).
+If you don't have money you can still support us by joining the [Discord Server](https://discord.gg/XkS5NVPTUY)
 
-If you would prefer to support us in a different way, please join our [Discord](https://discord.gg/XkS5NVPTUY)
+Contributions are voluntary donations. They do not buy features, priority support, early access, bug fixes or any influence over the roadmap. Roadmap decisions stay with the maintainers.
+
+We do not accept contributions that are tied to, or conditioned on, anything that would facilitate piracy or break the law. Eglantine does not distribute copyrighted games, firmware, encryption keys or any other proprietary Nintendo material, and we do not ask or encourage anyone to share them. Eglantine is an independent project and is not affiliated with, endorsed by or sponsored by Nintendo.
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=djihads80%2Feglantine&type=date&legend=bottom-right">
+<a href="https://www.star-history.com/?repos=eglantine-community%2Feglantine&type=date&legend=bottom-right">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=djihads80/eglantine&type=date&theme=dark&legend=bottom-right" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=djihads80/eglantine&type=date&legend=bottom-right" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=djihads80/eglantine&type=date&legend=bottom-right" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=eglantine-community/eglantine&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=eglantine-community/eglantine&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=eglantine-community/eglantine&type=date&legend=bottom-right" />
  </picture>
 </a>
 
 ## License
 
-Eglantine is licensed under the GPLv3 (or any later version). Refer to the [LICENSE.txt](https://github.com/Djihads80/Eglantine/blob/nx2/LICENSE.txt) file.
+Eglantine is licensed under the GPLv3 (or any later version). Refer to the [LICENSE.txt](https://github.com/Eglantine-Community/Eglantine/blob/nx2/LICENSE.txt) file.
