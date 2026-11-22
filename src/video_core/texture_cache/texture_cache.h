@@ -3273,6 +3273,46 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             join_copies_to_do.emplace_back(JoinCopy{true, overlap_id});
         } else {
             join_bad_overlap_ids.push_back(overlap_id);
+            // DIAG (EDEN_NX2_TC_TRACE): why this overlap could not be joined or aliased.
+            static const u64 diag_start = [] {
+                const char* value = std::getenv("EDEN_NX2_TC_TRACE");
+                return value != nullptr ? std::strtoull(value, nullptr, 10) : ~0ULL;
+            }();
+            static u32 diag_lines = 0;
+            if (frame_tick >= diag_start && diag_lines < 4000) [[unlikely]] {
+                ++diag_lines;
+                const ImageInfo& o = overlap.info;
+                const auto desc = [](const ImageInfo& i) {
+                    return fmt::format("{}x{} f{} t{} lv{} l{} blk{}/{}/{} ls{:#x} uls{:#x} tws{} s{} sp{}",
+                                       i.size.width, i.size.height, static_cast<u32>(i.format),
+                                       static_cast<u32>(i.type), i.resources.levels,
+                                       i.resources.layers, i.block.width, i.block.height,
+                                       i.block.depth, i.layer_stride,
+                                       i.maybe_unaligned_layer_stride, i.tile_width_spacing,
+                                       i.num_samples, i.is_sparse);
+                };
+                const bool same = gpu_addr == overlap.gpu_addr;
+                LOG_INFO(HW_GPU,
+                         "tc diag f{} bad: new {:#x} [{}] rt{} vs {:#x}+{:#x} [{}] flags{:#x} | "
+                         "same{} grown{} backing{} share{} stride{} stride1{} view{} "
+                         "size_strict{} size_relaxed{} block_eq{} sub_new_in_old{} sub_old_in_new{}",
+                         frame_tick, gpu_addr, desc(new_info),
+                         True(options & RelaxedOptions::RenderTarget), overlap.gpu_addr,
+                         overlap.guest_size_bytes, desc(o), static_cast<u32>(overlap.flags), same,
+                         grown.has_value(), IsAttachmentBackingUsable(overlap),
+                         CanShareAttachmentStorage(new_info, o),
+                         IsLayerStrideCompatible(new_info, o, false),
+                         IsLayerStrideCompatible(new_info, o, true),
+                         VideoCore::Surface::IsViewCompatible(o.format, new_info.format,
+                                                              broken_views, native_bgr),
+                         same && IsBlockLinearSizeCompatible(new_info, o, 0, 0, true),
+                         same && IsBlockLinearSizeCompatible(new_info, o, 0, 0, false),
+                         new_info.block == o.block,
+                         IsSubresource(new_info, overlap, gpu_addr, alias_options, broken_views,
+                                       native_bgr),
+                         IsSubresource(o, new_image_base, overlap.gpu_addr, alias_options,
+                                       broken_views, native_bgr));
+            }
         }
     };
     ForEachImageInRegion(cpu_addr, size_bytes, region_check);
