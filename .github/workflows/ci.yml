@@ -44,8 +44,8 @@ on:
       build_nix:
         description: Build the Nix packages too (yes), not at all (no), or only them (only)
         type: choice
-        options: [yes, no, only]
-        default: yes
+        options: ["yes", "no", "only"]
+        default: "yes"
       pgo:
         description: Also build the PGO variants
         type: choice

@@ -1,0 +1,95 @@
+name: fork-warm-cache
+
+# Fork-only (rdenno/Eglantine). Builds the tip of upstream's daily branch on THIS repository's
+# default branch and saves the compiler (ccache/sccache) and CPM caches.
+#
+# Why: GitHub caches are scoped to the ref that wrote them, and a branch can only restore its own
+# caches and the default branch's. Upstream's daily runs on the daily branch's own ref, so on this
+# fork every test branch started cold (~28 min of compiling on Linux). Caches written here, on the
+# default branch, are visible to every test branch built later.
+#
+# Test branches then build with ccache hits for everything they share with the daily branch. Pass
+# save_cache=true when dispatching ci.yml on a test branch to keep re-pushes of that branch warm too.
+on:
+  schedule:
+    - cron: "0 5 * * *" # after upstream's 03:00 daily
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Upstream branch whose tip is built (its objects seed the caches)
+        type: string
+        default: nx2-experimental
+      upstream:
+        description: Upstream repository the branch is read from
+        type: string
+        default: Djihads80/Eglantine
+      windows:
+        description: Also warm the Windows cache
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-warm-cache
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: Resolve commit
+    if: github.repository == 'rdenno/Eglantine'
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.r.outputs.sha }}
+      version: ${{ steps.r.outputs.version }}
+      skip: ${{ steps.r.outputs.skip }}
+    steps:
+      - id: r
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: ${{ inputs.upstream || 'Djihads80/Eglantine' }}
+          BRANCH: ${{ inputs.branch || 'nx2-experimental' }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$UPSTREAM/commits/$BRANCH" --jq .sha)
+          version=$(gh api "repos/$UPSTREAM/contents/VERSION?ref=$sha" --jq .content | base64 -d | tr -d '[:space:]')
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "version=${version:-0.0.0}" >> "$GITHUB_OUTPUT"
+          # A scheduled run skips a commit whose cache is already saved here.
+          skip=false
+          if [ "$GITHUB_EVENT_NAME" = schedule ] &&
+             gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=objects-v2-linux-x86_64-" \
+               --jq '.actions_caches[].key' | grep -q -- "-$sha\$"; then
+            skip=true
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          echo "$UPSTREAM $BRANCH -> $sha (version $version, skip $skip)"
+
+  linux:
+    name: Linux
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    uses: ./.github/workflows/build-linux.yml
+    with:
+      sha: ${{ needs.resolve.outputs.sha }}
+      version: ${{ needs.resolve.outputs.version }}
+      refspec: cache-warm
+      tag: cache-warm
+      arch: x86_64
+      pgo: none
+      save_cache: true
+
+  windows:
+    name: Windows
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true' && (github.event_name == 'schedule' || inputs.windows)
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      sha: ${{ needs.resolve.outputs.sha }}
+      version: ${{ needs.resolve.outputs.version }}
+      refspec: cache-warm
+      tag: cache-warm
+      pgo: none
+      save_cache: true
