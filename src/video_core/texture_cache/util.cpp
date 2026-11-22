@@ -1637,6 +1637,19 @@ bool IsLayerStrideCompatible(const ImageInfo& lhs, const ImageInfo& rhs,
         lhs.tile_width_spacing == rhs.tile_width_spacing && lhs.num_samples == rhs.num_samples) {
         return true;
     }
+    // A single-mip 2D image against a single-layer mip chain of the same layout: the layer stride
+    // of the chain counts its smaller levels, but with one layer no array offset is addressed and
+    // level 0 starts at the base either way, so the single-mip image is the chain's level 0.
+    // Mario Kart World renders its bloom input into a 640x360 target and samples the same memory
+    // as a 5-level texture; refusing this split them into two images, and the bloom chain never
+    // saw the target's writes (a self-feeding loop that turned the screen white).
+    if (lhs.type == ImageType::e2D && rhs.type == ImageType::e2D &&
+        lhs.resources.layers == 1 && rhs.resources.layers == 1 &&
+        (lhs.resources.levels == 1) != (rhs.resources.levels == 1) && lhs.format == rhs.format &&
+        lhs.block == rhs.block && lhs.tile_width_spacing == rhs.tile_width_spacing &&
+        lhs.num_samples == rhs.num_samples) {
+        return true;
+    }
     // If either of the layer strides is zero, we can assume they are compatible
     // These images generally come from rendertargets
     if (lhs.layer_stride == 0) {

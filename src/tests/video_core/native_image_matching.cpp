@@ -95,6 +95,48 @@ TEST_CASE("Arrays volumes and mip chains still require their layer layout",
     CHECK_FALSE(IsLayerStrideCompatible(lhs, rhs, true));
 }
 
+TEST_CASE("A single-mip target is level 0 of a single-layer mip chain at the same address",
+          "[video_core][native_image_matching]") {
+    // Mario Kart World's bloom: a 640x360 RGBA16F render target, then the same memory sampled as
+    // a 5-level texture whose layer stride includes the smaller levels.
+    ImageInfo target;
+    target.type = ImageType::e2D;
+    target.format = PixelFormat::R16G16B16A16_FLOAT;
+    target.size = {640, 360, 1};
+    target.resources = {.levels = 1, .layers = 1};
+    target.block = {0, 4, 0};
+    target.layer_stride = CalculateLayerStride(target);
+    target.maybe_unaligned_layer_stride = CalculateLayerSize(target);
+    auto chain = target;
+    chain.resources.levels = 5;
+    chain.layer_stride = CalculateLayerStride(chain);
+    chain.maybe_unaligned_layer_stride = CalculateLayerSize(chain);
+    REQUIRE(chain.layer_stride != target.layer_stride);
+    CHECK(IsLayerStrideCompatible(chain, target));
+    CHECK(IsLayerStrideCompatible(target, chain));
+
+    const ImageBase target_image{target, Address, 0x200000};
+    const auto joined = ResolveOverlap(chain, Address, 0x200000, target_image, true, false, false);
+    REQUIRE(joined);
+    CHECK(joined->resources.levels == 5);
+    const ImageBase chain_image{chain, Address, 0x200000};
+    const auto base = FindSubresource(target, chain_image, Address, {}, false, false);
+    REQUIRE(base);
+    CHECK(base->level == 0);
+
+    SECTION("Different block heights stay separate") {
+        auto other = target;
+        other.block.height = 3;
+        CHECK_FALSE(IsLayerStrideCompatible(chain, other));
+    }
+    SECTION("Array layers keep their layout") {
+        auto layered = chain;
+        layered.resources.layers = 2;
+        layered.layer_stride = CalculateLayerStride(layered);
+        CHECK_FALSE(IsLayerStrideCompatible(layered, target));
+    }
+}
+
 TEST_CASE("Attachment sub-extents preserve tiled storage and sampled texture dimensions",
           "[video_core][native_image_matching]") {
     auto backing = Surface();
