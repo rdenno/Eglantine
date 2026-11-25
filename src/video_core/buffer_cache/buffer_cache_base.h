@@ -269,6 +269,11 @@ public:
 
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
+    /// Around each round of collected CPU writes the GPU thread applies (InvalidateGPUCache):
+    /// the writes held back before it are the ones it applies.
+    void BeginCachedWrites();
+    void EndCachedWrites();
+
     /// Cancels pending downloads over the range, so a fence can't write them over newer bytes.
     void ClearDownload(DAddr base_addr, u64 size);
 
@@ -1088,6 +1093,17 @@ private:
     /// fence pops. A write to a range after a download was taken removes it from that download
     /// (and every other pending one): its bytes are older than the write.
     std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
+    /// Pages of GPU-written memory the guest CPU wrote, whose writes the GPU thread has not
+    /// applied yet (OnCPUWrite holds them back). Guest memory holds the newest bytes there: no
+    /// download may write over them before the write is applied, or it is lost. Between the
+    /// gather that takes the writes and their apply they are no longer pending in the cores'
+    /// lists, so PendingCpuWriteRanges alone doesn't cover them (Yoshi and the Mysterious Book
+    /// uploads shader code over a storage buffer range the GPU keeps writing, and drew with
+    /// what was left).
+    Common::RangeSet<DAddr> cpu_held_ranges;
+    /// The pages of cpu_held_ranges held since the current round of applies began: their writes
+    /// may sit in the cores' new lists, so the round's applies do not release them.
+    Common::RangeSet<DAddr> cpu_recent_held_ranges;
     PendingCpuWrites pending_cpu_writes;
     std::optional<Async_Buffer> current_buffer;
 

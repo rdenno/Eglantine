@@ -293,12 +293,35 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
 }
 
 template <class P>
+void BufferCache<P>::BeginCachedWrites() {
+    cpu_recent_held_ranges.Clear();
+}
+
+template <class P>
+void BufferCache<P>::EndCachedWrites() {
+    // Writes held back before the round were gathered by it and are applied now. The page of
+    // one collected while the round ran is held again (Core::GPUDirtyMemoryManager::Generation)
+    // and stays held until the next round.
+    cpu_held_ranges = std::move(cpu_recent_held_ranges);
+    cpu_recent_held_ranges.Clear();
+}
+
+template <class P>
 bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
         return false;
     }
     if (memory_tracker.IsRegionGpuModified(device_addr, size)) {
+        // Held back until the GPU thread applies it. Downloads taken before hold older bytes;
+        // the core reports one write per page, so the whole page is held.
+        const DAddr page_start = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
+        const u64 page_size = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE) - page_start;
+        for (auto& ranges : pending_download_ranges) {
+            ranges.Subtract(page_start, page_size);
+        }
+        cpu_held_ranges.Add(page_start, page_size);
+        cpu_recent_held_ranges.Add(page_start, page_size);
         return true;
     }
     WriteMemory(device_addr, size);
@@ -1019,6 +1042,9 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
         }
     }
     runtime.PostCopyBarrier();
+    cpu_held_ranges.ForEach([&](DAddr start, DAddr end) {
+        download_ranges.Subtract(start, end - start);
+    });
     pending_downloads.emplace_back(std::move(normalized_copies));
     pending_download_ranges.emplace_back(std::move(download_ranges));
     async_buffers.emplace_back(download_staging);
@@ -1269,13 +1295,17 @@ Common::RangeSet<DAddr> BufferCache<P>::PendingCpuWriteRanges() {
 template <class P>
 void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
                                            DAddr device_addr, const u8* data, u64 size) {
-    if (!cpu_written.Intersects(device_addr, size)) {
+    if (!cpu_written.Intersects(device_addr, size) && !cpu_held_ranges.Intersects(device_addr, size)) {
         device_memory.WriteBlockUnsafe(device_addr, data, size);
         return;
     }
     Common::RangeSet<DAddr> parts;
     parts.Add(device_addr, size);
     cpu_written.ForEachInRange(device_addr, size, [&parts](DAddr start, DAddr end) {
+        parts.Subtract(start, end - start);
+    });
+    // Held-back CPU writes already gathered but not applied yet are newer too.
+    cpu_held_ranges.ForEachInRange(device_addr, size, [&parts](DAddr start, DAddr end) {
         parts.Subtract(start, end - start);
     });
     parts.ForEach([&](DAddr start, DAddr end) {

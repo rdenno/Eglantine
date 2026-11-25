@@ -149,6 +149,10 @@ public:
     /// Notify rasterizer that any caches of the specified region are desync with guest
     virtual void OnCacheInvalidation(PAddr addr, u64 size) = 0;
 
+    /// Around each round of collected CPU writes (one InvalidateGPUCache).
+    virtual void BeginCachedWrites() {}
+    virtual void EndCachedWrites() {}
+
     /// OnCacheInvalidation for each of the CPU writes InvalidateGPUCache collected.
     virtual void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
         for (const auto& [addr, size] : ranges) {

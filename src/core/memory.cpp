@@ -1150,31 +1150,21 @@ struct Memory::Impl final : PageClaimSink {
             }
         };
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
-            auto& current_area = rasterizer_write_areas[core];
-            PAddr subaddress = address >> YUZU_PAGEBITS;
             static constexpr bool skip_untracked_aliases = true;
             if (skip_untracked_aliases && address != 0 &&
                 !gpu_device_memory->IsAnyPageCached(address, size)) {
                 return;
             }
-            if (current_area.last_address != subaddress) {
-                // Short circuit the need to check for address/size
-                auto const do_collection = (address != 0 && size != 0)
-                    && system.GPU().OnCPUWrite(address, size);
-                if (do_collection) {
-                    current_area.last_address = subaddress;
-                } else {
-                    return;
-                }
-            }
             VideoCommon::Nx2Hazard::NoteGuestWrite(address, size);
-            gpu_dirty_managers[core].Collect(address, size);
+            // The GPU's OnCPUWrite holds the page back until the write is applied; it runs for
+            // the first write to a page after each gather (GPUDirtyMemoryManager::Generation).
+            gpu_dirty_managers[core].CollectWrite(
+                address, size, address >> YUZU_PAGEBITS, rasterizer_write_areas[core], [&] {
+                    // Short circuit the need to check for address/size
+                    return address != 0 && size != 0 && system.GPU().OnCPUWrite(address, size);
+                });
         });
     }
-
-    struct GPUDirtyState {
-        PAddr last_address;
-    };
 
     void InvalidateGPUMemory(u8* p, size_t size) {
         constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
@@ -1211,7 +1201,8 @@ struct Memory::Impl final : PageClaimSink {
     std::atomic<bool> page_tracker_enabled{};
     PageTrackerState page_tracker_state{*this};
     Core::Memory::PageTracker page_tracker{*this};
-    std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
+    std::array<Core::GPUDirtyMemoryManager::ReportedPage, Core::Hardware::NUM_CPU_CORES>
+        rasterizer_write_areas{};
     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
     std::mutex sys_core_guard;

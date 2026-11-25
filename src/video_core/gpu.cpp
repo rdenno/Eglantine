@@ -118,10 +118,15 @@ struct GPU::Impl {
         writes.clear();
         std::function<void(PAddr, size_t)> callback_writes(
             [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
+        auto* const rasterizer = renderer->ReadRasterizer();
+        // The pages held back for the writes this round takes stay out of downloads until
+        // they are applied (BufferCache::cpu_held_ranges).
+        rasterizer->BeginCachedWrites();
         system.GatherGPUDirtyMemory(callback_writes);
         if (!writes.empty()) {
-            renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+            rasterizer->OnCacheInvalidations(writes);
         }
+        rasterizer->EndCachedWrites();
     }
 
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
