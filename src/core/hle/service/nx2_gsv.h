@@ -3063,7 +3063,7 @@ public:
         RegisterHandlersTipc({
             {1, &INx2VideoSession::CreateDecoderService, "CreateVideoDecoderSession"},
             {3, &INx2VideoSession::GetEvent, "GetInputEvent"},
-            {6, &INx2VideoSession::Succeed, "Start"},
+            {6, &INx2VideoSession::Start, "Start"},
             {8, &INx2VideoSession::Flush, "Flush"},
             {101, &INx2VideoSession::Configure, "Configure"},
             {109, &INx2VideoSession::SubmitInput, "Decode"},
@@ -3082,6 +3082,7 @@ public:
     }
 
     ~INx2VideoSession() override {
+        m_ready->SetRunning(system.Kernel(), false);
         if (m_worker.joinable()) {
             {
                 std::scoped_lock lk{m_mutex};
@@ -3242,16 +3243,13 @@ private:
                 "nx2:vdec ready",
                 [ready = m_ready, &kernel = system.Kernel()](
                     s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
-                    std::scoped_lock lk{ready->mutex};
-                    if (ready->event != nullptr && ready->room.load(std::memory_order_relaxed)) {
-                        ready->event->Signal(kernel);
-                    }
+                    ready->Signal(kernel);
                     return std::nullopt;
                 });
             constexpr std::chrono::nanoseconds ReadyInterval{std::chrono::milliseconds{4}};
             system.CoreTiming().ScheduleLoopingEvent(ReadyInterval, ReadyInterval, m_ready_timer);
         }
-        m_event->Signal(system.Kernel());
+        m_ready->Signal(system.Kernel());
         IPC::ResponseBuilder rb{ctx, 2, 1, 0};
         rb.Push(ResultSuccess);
         rb.PushCopyObjects(ctx, m_event->GetReadableEvent());
@@ -3350,6 +3348,9 @@ private:
     // handed out keep their place, so the sync values stay in step with the client's ring.
     void Flush(HLERequestContext& ctx) {
         Log(ctx, ctx.GetCommand() == 8 ? "flush" : "stop");
+        if (ctx.GetCommand() == 207) {
+            m_ready->SetRunning(system.Kernel(), false);
+        }
         {
             std::scoped_lock lk{m_mutex};
             m_inputs.clear();
@@ -3369,6 +3370,7 @@ private:
 
     void Finalize(HLERequestContext& ctx) {
         Log(ctx, "finalize");
+        m_ready->SetRunning(system.Kernel(), false);
         {
             std::scoped_lock lk{m_mutex};
             CompleteHandedFences();
@@ -3716,11 +3718,35 @@ private:
         }
     }
 
+    // The ready event stays quiet once Stop (207), Finalize (115) or the destructor ran: a game
+    // woken on a decoder it had torn down aborts on purpose (2162-0001; Kirby Air Riders after
+    // its intro movie, Yoshi and the Mysterious Book after its opening). Start (6) runs it again.
     struct ReadyState {
+        void Signal(Kernel::KernelCore& kernel_) {
+            std::scoped_lock lk{mutex};
+            if (event != nullptr && running && room.load(std::memory_order_relaxed)) {
+                event->Signal(kernel_);
+            }
+        }
+        void SetRunning(Kernel::KernelCore& kernel_, bool value) {
+            std::scoped_lock lk{mutex};
+            running = value;
+            if (event != nullptr && !running) {
+                event->Clear(kernel_);
+            }
+        }
         std::mutex mutex;
         Kernel::KEvent* event{};
         std::atomic<bool> room{true}; ///< The input queue takes more frames
+        bool running{true};           ///< Guarded by `mutex`
     };
+
+    void Start(HLERequestContext& ctx) {
+        Log(ctx, "start");
+        m_ready->SetRunning(system.Kernel(), true);
+        m_ready->Signal(system.Kernel());
+        TipcReplyWords(ctx, {});
+    }
 
     KernelHelpers::ServiceContext m_context;
     std::shared_ptr<Nx2NativeObjects> m_objects;
