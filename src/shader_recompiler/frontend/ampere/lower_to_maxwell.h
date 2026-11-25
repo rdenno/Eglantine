@@ -1614,6 +1614,18 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                      (u64{1} << 48) | (u64{insn.Bits(75, 1)} << 39));
                 break;
             }
+            // SHF.L.U32.HI over a zero low word: the upper word of (high:0) << count is
+            // high << count, a plain left shift; .W masks the count to 5 bits as SHL.W does, and
+            // without it a count of 32 or more gives 0 in both. Yoshi and the Mysterious Book
+            // shifts by a constant buffer amount this way (Orchid's SHF.L.W.U32.HI lowering).
+            if (!right && high_result && low == 255 && insn.Bits(73, 2) == 3 && shift != ~0U &&
+                shift_operand &&
+                (insn.words[2] & ~(0x000118ffU | (opcode == 0xc19 ? 0x08000000U : 0U))) == 0x00000600U) {
+                load_shift();
+                emit(base(0x5c48000000000000ULL) | (u64{high} << 8) | (u64{shift} << 20) |
+                     (u64{insn.Bits(75, 1)} << 39));
+                break;
+            }
             // SHF.R.U32 of the low word with a zero high word: a plain logical right shift.
             if (right && !high_result && high == 255 && insn.Bits(73, 2) == 3 && shift != ~0U &&
                 shift_operand &&
