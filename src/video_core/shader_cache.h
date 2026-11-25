@@ -11,6 +11,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -129,6 +130,9 @@ protected:
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     bool last_shaders_valid = false;
+    /// While the bound programs fail, RefreshStages looks at them again at this time even
+    /// without a shader bind, so a program whose upload completed late can recover.
+    std::chrono::steady_clock::time_point next_failed_stage_retry{};
     /// Nx2Perf MacroReadWriterSet: Tegra::g_nx2_code_epoch read before shader_infos were last
     /// resolved (0: they are not valid), and the device code range of each program (size 0: none).
     u64 nx2_resolved_epoch{};
@@ -190,8 +194,12 @@ private:
     void RethrowIfRejected(VAddr addr);
     /// Whether a native program at this address was rejected.
     bool IsRejected(VAddr addr);
-    /// Remembers the exception being handled as this address's rejection.
-    void RememberRejection(VAddr addr);
+    /// Remembers the exception being handled as this address's rejection, with the bytes it
+    /// was made from (RecheckRejection).
+    void RememberRejection(VAddr addr, GPUVAddr gpu_addr);
+    /// Reads a rejected program's bytes again (at most every 250 ms); when they changed, drops
+    /// the rejection so the program is lowered again. Returns whether it was dropped.
+    bool RecheckRejection(VAddr addr);
     /// Hash of the state task and mesh programs are translated with.
     u64 MeshStateHash() const;
 
@@ -206,7 +214,13 @@ private:
     /// Native programs the lowering rejected, by address, so each draw or dispatch rethrows the
     /// first error instead of lowering again; dropped when guest memory there is written.
     std::mutex rejected_mutex;
-    ::Common::unordered_map<u64, std::exception_ptr> rejected_native;
+    struct Rejection {
+        std::exception_ptr error;
+        GPUVAddr gpu_addr{};
+        std::vector<u8> bytes; ///< What the rejection was made from (empty: rechecks off)
+        std::chrono::steady_clock::time_point made, checked;
+    };
+    ::Common::unordered_map<u64, Rejection> rejected_native;
     /// Bounds of every address ever rejected (never shrinks): a quick test for invalidations.
     std::atomic<VAddr> rejected_lowest{~VAddr{}};
     std::atomic<VAddr> rejected_highest{};
