@@ -1514,13 +1514,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 coordinate = insn.Bits(24, 8);
             const u32 channels = insn.Bits(72, 4);
-            // Maxwell's codes: 0 = 1D, 3 = 2D, 4 = 2D_ARRAY, 5 = 3D. (Hookshot 88b554e572) 1D, one
-            // coordinate register: 17 of OoT's compute programs stopped here (1D_BUFFER and
-            // 1D_ARRAY, 1 and 2, stay refused).
+            // Maxwell's codes: 0 = 1D, 1 = 1D_BUFFER, 3 = 2D, 4 = 2D_ARRAY, 5 = 3D. (Hookshot
+            // 88b554e572) 1D, one coordinate register: 17 of OoT's compute programs stopped here.
+            // 1D_BUFFER, one coordinate register as well: Yoshi and the Mysterious Book's compute
+            // passes read buffer surfaces (Orchid fe1ee6d9b7). 1D_ARRAY (2) stays refused.
             const u32 dimension = insn.Bits(61, 3);
-            if ((insn.words[2] & ~0xf00U) != 0x001e0000 || channels == 0 || (dimension != 0 && dimension < 3) ||
+            if ((insn.words[2] & ~0xf00U) != 0x001e0000 || channels == 0 || dimension == 2 ||
                 dimension > 5 || binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) || dest == 255 ||
-                coordinate > (dimension >= 4 ? 252U : dimension == 0 ? 254U : 253U))
+                coordinate > (dimension >= 4 ? 252U : dimension <= 1 ? 254U : 253U))
                 return fail(index, "native formatted surface load mode");
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
                 return fail(index, "native surface descriptor buffer conflict");
@@ -1529,15 +1530,20 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (u64{channels} << 20) | (u64{dimension} << 33) | (u64{offset} << 36) | (u64{1} << 51));
             break;
         }
-        case 0xb9b: { // SUST.P.2D/3D.IGN, direct descriptor, channel mask at 72-75.
+        case 0xb9b: { // SUST.P.1D_BUFFER/2D/2D_ARRAY/3D.IGN, direct descriptor, channel mask at 72-75.
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
             const u32 dimension = insn.Bits(61, 3);
             const u32 channels = insn.Bits(72, 4);
             const u32 mode = insn.words[2] & ~0xf00U;
             const bool strong = mode == 0x0010a000; // .STRONG.SM: fenced on both sides
-            if ((mode != 0x00100000 && !strong) || channels == 0 || dimension < 3 || dimension > 5 ||
-                binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) || data > 252 || coordinate > (dimension >= 4 ? 252U : 253U))
+            // 1D_BUFFER (1): one coordinate register. Yoshi and the Mysterious Book's compute
+            // passes write buffer surfaces (Orchid fe1ee6d9b7); rejecting them left its title
+            // background unbuilt and the game reading data they never wrote.
+            if ((mode != 0x00100000 && !strong) || channels == 0 ||
+                (dimension != 1 && (dimension < 3 || dimension > 5)) || binding >= 18 ||
+                offset > 0x1fff || insn.Bits(59, 2) || data > 252 ||
+                coordinate > (dimension >= 4 ? 252U : dimension == 1 ? 254U : 253U))
                 return fail(index, "native formatted surface store mode");
             // A second descriptor buffer: SUST.B with the handle, loaded from that buffer, in R250.
             const bool bindless = !bind_texture_buffer(binding);
@@ -1551,14 +1557,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (strong) emit(0xef98000000000000ULL | predicate | (u64{1} << 8));
             break;
         }
-        case 0x593: { // SUATOM.D.2D/3D.ADD/OR.STRONG.GPU.IGN U32, returning the old value.
+        case 0x593: { // SUATOM.D.1D/1D_BUFFER/2D/2D_ARRAY/3D.ADD/OR.STRONG.GPU.IGN U32, returning the old value.
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
             const u32 dimension = insn.Bits(61, 3);
             const u32 operation = insn.Bits(87, 3);
+            // Maxwell's codes as SULD: 1D and 1D_BUFFER take one coordinate register, 2D two,
+            // 2D_ARRAY and 3D three. Yoshi and the Mysterious Book adds to buffer surfaces.
             if ((insn.words[2] & ~0x03800000U) != 0x001ee000U || (operation != 0 && operation != 6) ||
-                (dimension != 3 && dimension != 5) || binding >= 18 ||
-                offset > 0x1fff || insn.Bits(59, 2) || coordinate > (dimension == 5 ? 252U : 253U))
+                dimension == 2 || dimension > 5 || binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) ||
+                coordinate > (dimension >= 4 ? 252U : dimension <= 1 ? 254U : 253U))
                 return fail(index, "native surface reduction mode");
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
                 return fail(index, "native surface descriptor buffer conflict");
