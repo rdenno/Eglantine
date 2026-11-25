@@ -2548,7 +2548,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 in_b = meta ? meta : coordinates - in_a;
             if ((insn.Bits(61, 3) != 1 && !array) || offset_mode == 3 || insn.Bits(79, 1) ||
                 insn.Bits(81, 3) != 7 || insn.Bits(59, 1) ||
-                (bindless && (offset_mode || depth)) ||
+                (bindless && (offset_mode == 2 || depth)) ||
                 (offset_mode && source_b == 255) ||
                 (source_a != 255 &&
                  source_a + in_a > ((array || meta) ? shadow_boundary : 246U)) || (source_b != 255 && source_b + in_b > 246) ||
@@ -2627,7 +2627,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                         break;
                     }
                 }
-                const u32 meta_reg = 246 + (second_buffer ? 1U : 0U) + i;
+                // TLD4.B lists the handle first (R246), then the offsets.
+                const u32 meta_reg = 246 + ((second_buffer || bindless) ? 1U : 0U) + i;
                 if (imm) {
                     emit(0x010000000007f000ULL | meta_reg | (u64{*imm} << 20));
                 } else {
@@ -2641,10 +2642,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                      (u64{insn.Bits(87, 2)} << 38) | (u64{insn.Bits(90, 1)} << 49) |
                      (u64{depth} << 50) | (u64{7} << 51));
             } else if (bindless) {
+                // AOFFI as for a second descriptor buffer: the packed offset follows the handle.
+                // Yoshi and the Mysterious Book gathers with an offset (Orchid 0xf63 lowering).
                 emit(0x5c98000000000000ULL | predicate | 246 | (u64{15} << 39) | (u64{handle} << 20));
                 emit(0xdec0000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{246} << 20) |
-                     (u64{array ? 3U : 2U} << 28) | (u64{mask} << 31) | (u64{insn.Bits(87, 2)} << 38) |
-                     (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
+                     (u64{array ? 3U : 2U} << 28) | (u64{mask} << 31) | (u64{offset_mode} << 36) |
+                     (u64{insn.Bits(87, 2)} << 38) | (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
             } else {
             emit(0xc800000000000000ULL | predicate | 250 | (u64{250} << 8) |
                  (u64{meta ? 246U : 255U} << 20) | (u64{array ? 3U : 2U} << 28) | (u64{mask} << 31) |
