@@ -72,6 +72,12 @@ public:
         func();
     }
 
+    /// Bits of the guest syncpoints 64 * word .. 64 * word + 63 incremented since the last call
+    /// (only those with a guest mirror set, the ones Switch 2 clients wait on through its page).
+    u64 TakeMovedGuest(u32 word) {
+        return guest_moved[word].exchange(0, std::memory_order_acq_rel);
+    }
+
     void IncrementHost(u32 syncpoint_id);
 
     void WaitGuest(u32 syncpoint_id, u32 expected_value);
@@ -107,6 +113,7 @@ private:
 
     std::mutex guard;
     GuestMirror guest_mirror; ///< Guarded by `guard`.
+    std::array<std::atomic<u64>, (NUM_MAX_SYNCPOINTS + 63) / 64> guest_moved{};
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;
 };

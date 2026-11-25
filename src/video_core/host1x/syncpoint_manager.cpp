@@ -92,6 +92,11 @@ void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_var
         guest_mirror(*mirrored_id, syncpoint.load(std::memory_order_relaxed) + 1);
     }
     const u32 new_value{syncpoint.fetch_add(1, std::memory_order_acq_rel) + 1};
+    if (mirrored_id && guest_mirror) {
+        // After the page and the value: whoever takes the bit finds the new value in both.
+        guest_moved[*mirrored_id / 64].fetch_or(u64{1} << (*mirrored_id % 64),
+                                                std::memory_order_acq_rel);
+    }
     auto it = action_storage.begin();
     while (it != action_storage.end()) {
         if (it->expected_value > new_value) {

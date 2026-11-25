@@ -4137,6 +4137,7 @@ private:
             return;
         }
         UpdateSyncptValues();
+        auto& manager = system.Host1x().GetSyncpointManager();
         bool acked = false;
         const u32 words = (m_syncpt_count + 63) / 64;
         for (u32 w = 0; w < words; ++w) {
@@ -4144,6 +4145,14 @@ private:
             const u64 ro_address = m_syncpt_ro + SyncptRoBitsOffset + w * 8;
             if (m_syncpt_memory->Read64(ro_address) != rw_bits) {
                 m_syncpt_memory->Write64(ro_address, rw_bits);
+                acked = true;
+            }
+            // A wait armed on a syncpoint whose value moved is woken too: re-arming the same bit
+            // leaves the bits unchanged, and a client that only re-arms would otherwise sleep until
+            // its own timeout. The manager says which moved (the mirror already updated the page,
+            // so the page can't). Yoshi and the Mysterious Book's movie player waited out its
+            // timeout and aborted (2162-0001); Orchid saw it stuck loading levels without this.
+            if (w < HostSyncpoints / 64 && (rw_bits & manager.TakeMovedGuest(w)) != 0) {
                 acked = true;
             }
         }
