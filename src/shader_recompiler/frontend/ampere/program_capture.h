@@ -25,8 +25,14 @@ public:
             if (target < 0 || target % 16 || target >= MaximumInstructions * 16)
                 return Result::InvalidTarget;
             // CALL.REL.NOINC (bit 86) pushes no return address, but its callee still returns
-            // with RET.REL.NODEC through the link register set ahead of the call.
-            if (opcode == 0x944) {
+            // with RET.REL.NODEC through the link register set ahead of the call. A predicated
+            // CALL.REL.NOINC is instead a loop-exit jump inside the program, as the lowering
+            // treats it: counted as a call, its target held the main EXIT back from ending the
+            // capture, which then ran on into whatever followed the shader in memory (Orchid
+            // cf66896a57).
+            const bool noinc_jump = opcode == 0x944 && (instruction.words[2] & 0x400000) != 0 &&
+                                    instruction.words[0] != 0x7944;
+            if (opcode == 0x944 && !noinc_jump) {
                 last_call_target = std::max(last_call_target, static_cast<u32>(target / 16));
             } else {
                 last_forward_target = std::max(last_forward_target, static_cast<u32>(target / 16));
