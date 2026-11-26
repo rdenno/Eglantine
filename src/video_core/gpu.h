@@ -265,6 +265,11 @@ public:
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     [[nodiscard]] VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size);
 
+    /// An area OnCPURead returned answers later reads only while this stays the same. With
+    /// ordered reads it moves with every command queued for the GPU thread,
+    /// which may write the area.
+    [[nodiscard]] u64 ReadAreaEpoch() const;
+
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     void FlushRegion(DAddr addr, u64 size);
 

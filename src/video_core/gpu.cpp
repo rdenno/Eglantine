@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -302,9 +303,49 @@ struct GPU::Impl {
         gpu_thread.FlushRegion(addr, size, is_async);
     }
 
+    /// Preemptive areas are written back at fences, but the asynchronous GPU thread may not have
+    /// run the commands that write them yet, and report and semaphore values stay in the query
+    /// cache until it is flushed. Yoshi and the Mysterious Book read such stale values and
+    /// corrupted its own heap (2162-0001 after the first movie), then drew with garbage state.
+    /// Reads run behind the queued work, with synchronous GPU emulation too (Yoshi corrupted
+    /// itself there the same way). EDEN_NX2_ORDERED_READS=0: off.
+    bool OrderedReads() const {
+        static const bool ordered_reads = [] {
+            const char* value = std::getenv("EDEN_NX2_ORDERED_READS");
+            return value == nullptr || value[0] != '0';
+        }();
+        return ordered_reads;
+    }
+
+    /// Runs a read's flush on the GPU thread and waits for it. Ordered reads run it after every
+    /// command queued before the read: a sync operation runs at the GPU thread's next TickWork,
+    /// which draws reach in the middle of a command list.
+    void RunReadFlush(std::function<void()>&& flush) {
+        if (OrderedReads()) {
+            gpu_thread.RunOrdered(std::move(flush), is_async);
+            return;
+        }
+        const u64 fence = RequestSyncOperation(std::move(flush));
+        gpu_thread.TickGPU(is_async);
+        WaitForSyncOperation(fence);
+    }
+
+    u64 ReadAreaEpoch() const {
+        return OrderedReads() ? gpu_thread.WorkPushed() : 0;
+    }
+
     VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
         if (raster_area.preemtive) {
+            if (!OrderedReads()) {
+                return raster_area;
+            }
+            RunReadFlush([this, raster_area]() {
+                InvalidateGPUCache();
+                renderer->ReadRasterizer()->FlushRegion(
+                    raster_area.start_address, raster_area.end_address - raster_area.start_address,
+                    VideoCommon::CacheType::BufferCache | VideoCommon::CacheType::QueryCache);
+            });
             return raster_area;
         }
         raster_area.preemtive = true;
@@ -315,13 +356,11 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
-        const u64 fence = RequestSyncOperation([this, raster_area]() {
+        RunReadFlush([this, raster_area]() {
             // Apply collected guest writes before downloading GPU data over guest memory.
             InvalidateGPUCache();
             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
         });
-        gpu_thread.TickGPU(is_async);
-        WaitForSyncOperation(fence);
         return raster_area;
     }
 
@@ -665,6 +704,10 @@ void GPU::PushGPUEntries(s32 channel, Tegra::CommandList&& entries) {
 
 VideoCore::RasterizerDownloadArea GPU::OnCPURead(PAddr addr, u64 size) {
     return impl->OnCPURead(addr, size);
+}
+
+u64 GPU::ReadAreaEpoch() const {
+    return impl->ReadAreaEpoch();
 }
 
 void GPU::FlushRegion(DAddr addr, u64 size) {

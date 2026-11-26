@@ -1114,10 +1114,14 @@ struct Memory::Impl final : PageClaimSink {
             return;
         }
         auto& current_area = rasterizer_read_areas[core];
+        // An area holds until a trap is armed and, with ordered reads, until GPU work is queued
+        // (the area was flushed behind the work queued before it).
+        const u64 epoch = system.GPU().ReadAreaEpoch();
         if (const u64 generation = read_trap_generation.load(std::memory_order_acquire);
-            read_area_generations[core] != generation) {
+            read_area_generations[core] != generation || read_area_epochs[core] != epoch) {
             current_area = {};
             read_area_generations[core] = generation;
+            read_area_epochs[core] = epoch;
         }
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             const DAddr end_address = address + size;
@@ -1203,6 +1207,7 @@ struct Memory::Impl final : PageClaimSink {
 
     std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
+    std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_epochs{};
     std::atomic<u64> read_trap_generation{};
     std::set<u64> armed_read_traps;
     std::atomic<size_t> armed_read_trap_count{};

@@ -123,6 +123,8 @@ struct SynchState final {
     CommandQueue queue;
     u64 last_fence{};
     std::atomic<u64> signaled_fence{};
+    /// Moves with each command pushed other than ticks and reads: work that may write guest memory.
+    std::atomic<u64> work_pushed{};
     std::condition_variable_any cv;
 };
 
@@ -153,11 +155,21 @@ public:
     /// Runs func on the GPU thread once the commands queued before it have been processed.
     void Run(std::function<void()>&& func, bool is_async, bool before_later_reads = false);
 
+    /// Runs `func` on the GPU thread after every command queued before it, and waits for it.
+    /// It doesn't count as work (WorkPushed): reads only write back what queued work wrote.
+    void RunOrdered(std::function<void()>&& func, bool is_async) {
+        PushCommand(RunCommand{std::move(func), true}, true, is_async, false);
+    }
+
+    [[nodiscard]] u64 WorkPushed() const {
+        return state.work_pushed.load(std::memory_order_acquire);
+    }
+
     void NotifyShutdown();
 
 private:
     /// Pushes a command to be executed by the GPU thread
-    u64 PushCommand(CommandData&& command_data, bool block, bool is_async);
+    u64 PushCommand(CommandData&& command_data, bool block, bool is_async, bool is_work = true);
 
     Core::System& system;
     VideoCore::RasterizerInterface* rasterizer = nullptr;

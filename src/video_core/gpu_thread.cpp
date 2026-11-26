@@ -387,7 +387,8 @@ void ThreadManager::FlushAndInvalidateRegion(DAddr addr, u64 size, bool is_async
     rasterizer->OnCacheInvalidation(addr, size);
 }
 
-u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_async) {
+u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_async,
+                                bool is_work) {
     if (!is_async) {
         // In synchronous GPU mode, block the caller until the command has executed
         block = true;
@@ -395,6 +396,9 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
 
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
+    if (is_work && !std::holds_alternative<GPUTickCommand>(command_data)) {
+        state.work_pushed.fetch_add(1, std::memory_order_acq_rel);
+    }
     state.queue.EmplaceWait(std::move(command_data), fence, block);
     if (Tegra::Nx2PendingWake::On()) [[unlikely]] {
         Tegra::Nx2PendingWake::Wake(Tegra::Nx2PendingWake::push_seq, Tegra::Nx2PendingWake::ByPush);
