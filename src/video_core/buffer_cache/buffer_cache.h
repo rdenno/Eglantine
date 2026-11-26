@@ -3681,11 +3681,12 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
     if (total_size_bytes == 0) {
         return;
     }
-    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
-
+    // CPU writes collected while the GPU copy is waited for are newer than it: the pending ones
+    // are read after the wait, right before the bytes are written back.
     if constexpr (requires { buffer.Mapped(); }) {
         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
             runtime.Wait(buffer.LastUsageTick());
+            const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
             for (const BufferCopy& copy : copies) {
                 WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + copy.src_offset,
                                       mapped.data() + copy.src_offset, copy.size);
@@ -3704,6 +3705,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
         }
         runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
         runtime.Finish();
+        const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
         for (const BufferCopy& copy : copies) {
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
             // Undo the modified offset
@@ -3715,6 +3717,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
         const std::span<u8> immediate_buffer = ImmediateBuffer(largest_copy);
         for (const BufferCopy& copy : copies) {
             buffer.ImmediateDownload(copy.src_offset, immediate_buffer.subspan(0, copy.size));
+            const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
             WriteDownloadedMemory(cpu_written, copy_device_addr, immediate_buffer.data(),
                                   copy.size);
