@@ -1138,7 +1138,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
             recorded |= FrameDumpDrawInputs(is_indexed, shader_hashes);
             if (VideoCommon::ResourceTrace::Enabled()) {
                 const auto keys = pipeline_cache.GraphicsNativeKeys(shader_hashes);
-                if (std::ranges::find(keys, 0x44c5c4f3fdaaf250ULL) != keys.end()) {
+                if (VideoCommon::ResourceTrace::HasTerrainProgram(keys)) {
                     for (const auto& descriptor : guest_descriptor_queue.TraceBuffers()) {
                         recorded |= frame_dump.NoteHostBuffer(
                             static_cast<u32>(descriptor.descriptor), descriptor.binding.buffer,
@@ -3456,7 +3456,6 @@ bool RasterizerVulkan::FrameDumpDrawInputs(bool is_indexed, std::span<const u64>
             if (slot < 0 && !is_indexed) {
                 return;
             }
-            constexpr u32 BUFFER_CAP = 4U << 20;
             const u32 size = (std::min)(binding.size, BUFFER_CAP);
             FrameDump::VertexInput& input = inputs.emplace_back(FrameDump::VertexInput{
                 .slot = slot,

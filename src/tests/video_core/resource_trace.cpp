@@ -66,7 +66,7 @@ TEST_CASE("Resource recorder saves baseline and acknowledged checkpoints", "[res
     REQUIRE(Trace::Enabled());
     REQUIRE(Trace::Sampling());
     const std::array<u64, 1> unrelated{123};
-    const std::array<u64, 1> terrain{0x44c5c4f3fdaaf250ULL};
+    const std::array<u64, 1> terrain{Trace::TERRAIN_PROGRAM_KEY};
     REQUIRE_FALSE(Trace::BeginDraw(unrelated));
     REQUIRE(Trace::BeginDraw(terrain));
     Trace::Note("draw", R"("draw":1,"stages":[])");

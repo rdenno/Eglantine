@@ -158,7 +158,7 @@ void Stop() {
 }
 
 bool BeginDraw(std::span<const u64> native_keys) {
-    if (!Sampling() || std::ranges::find(native_keys, 0x44c5c4f3fdaaf250ULL) == native_keys.end()) {
+    if (!Sampling() || !HasTerrainProgram(native_keys)) {
         return false;
     }
     if (draws++ >= 128) {

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <ostream>
@@ -69,6 +70,15 @@ extern std::atomic<bool> sampling;
 }
 [[nodiscard]] inline bool Sampling() {
     return sampling.load(std::memory_order_relaxed);
+}
+
+/// Native program key of the terrain program the trace follows.
+inline constexpr u64 TERRAIN_PROGRAM_KEY = 0x44c5c4f3fdaaf250ULL;
+
+/// Whether a draw's native program keys (one per stage, 0 where unbound) include the terrain
+/// program.
+[[nodiscard]] inline bool HasTerrainProgram(std::span<const u64> native_keys) {
+    return std::ranges::find(native_keys, TERRAIN_PROGRAM_KEY) != native_keys.end();
 }
 
 /// Rasterizer thread only: enables with EDEN_NX2_TERRAIN_TRACE=<directory> or debug knob13.
