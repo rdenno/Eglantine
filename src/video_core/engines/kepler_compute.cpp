@@ -1466,6 +1466,22 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
             if (input) break;
         }
     }
+    if (!have_pair && !(has_program_handles && input)) {
+        // Named slots holding images of different formats (Orchid's converting pair, from zortos293
+        // 0f9b1c31e): the output at least as large as the input.
+        for (const auto& [from, to] : {std::pair{0x90U, 0xa0U}, {0x328U, 0x348U}, {0x60U, 0x70U}}) {
+            const auto in = image(from), out = image(to);
+            if (in && out && in->Address() != 0 && out->Address() != 0 && in->Address() != out->Address() &&
+                in->IsBlockLinear() && out->IsBlockLinear() && in->Width() >= 64 &&
+                out->Width() >= in->Width() && out->Height() >= in->Height() &&
+                out->Width() <= in->Width() * 4) {
+                input = in;
+                output = out;
+                have_pair = true;
+                break;
+            }
+        }
+    }
     if (!have_pair && !has_program_handles && !upscale_pair(input, output, false)) {
         input.reset();
         output.reset();
@@ -1491,8 +1507,30 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         }
         return false;
     };
-    if (!input || !output)
+    if (!input || !output) {
+        // Describe what was there, so a new game's pair can be told apart from its other images.
+        const auto describe = [&](u32 offset) {
+            const auto tic = image(offset);
+            return tic ? fmt::format(" +{:#x}:{:#x} {}x{} f{:#x}{}", offset, tic->Address(), tic->Width(),
+                                     tic->Height(), static_cast<u32>(tic->format.Value()),
+                                     tic->IsBlockLinear() ? "" : " pitch")
+                       : std::string{};
+        };
+        std::string reads_text, stores_text, slots_text;
+        if (has_program_handles) {
+            const auto& [reads, stores] = NativeImageHandles(regs.code_loc.Address());
+            for (const u32 read : reads) reads_text += describe(read);
+            for (const u32 store : stores) stores_text += describe(store);
+        }
+        for (u32 offset = 0x60; offset < 0x120; offset += 0x10) slots_text += describe(offset);
+        slots_text += describe(0x328) + describe(0x348);
+        static std::unordered_set<GPUVAddr> described;
+        if (described.insert(regs.code_loc.Address()).second && described.size() <= 32) {
+            LOG_INFO(HW_GPU, "Upscale fallback candidates for {:#x}: reads[{} ] stores[{} ] slots[{} ]",
+                     regs.code_loc.Address(), reads_text, stores_text, slots_text);
+        }
         return skip("no input/output image pair in the program's handles or cbuf0+0x80..0x11c");
+    }
     using RTFormat = Tegra::RenderTargetFormat;
     const auto blit_format = [](const Texture::TICEntry& tic) -> std::optional<RTFormat> {
         switch (tic.format) {
