@@ -15,10 +15,12 @@
 #include <cstdlib>
 #include <limits>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "common/alignment.h"
+#include "common/cityhash.h"
 #include "common/common_funcs.h"
 #include "common/common_types.h"
 #include "common/div_ceil.h"
@@ -42,11 +44,21 @@ enum class Type {
     Flip,  ///< Pages the CPU modified once, while tracked, since the last reset
     NoHot, ///< Pages the GPU modified: never hot
     HotClean, ///< Hot pages already uploaded this frame
+    FlipFrame, ///< Tracked pages the CPU modified this frame
     Max
 };
 
 /// Frames since start, moved by BufferCache::TickFrame. Hot page state is dropped every 128.
 inline std::atomic<u32> g_hot_page_epoch{0};
+
+/// EDEN_NX2_HOT_INTRA_FRAME=0 lets pages the CPU rewrites within one frame become hot again.
+[[nodiscard]] inline bool HotIntraFrameCheck() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_HOT_INTRA_FRAME");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
 
 /// EDEN_NX2_HOT_PAGES=0 turns the hot page handling off.
 [[nodiscard]] inline bool HotPagesEnabled() {
@@ -151,12 +163,14 @@ struct WordManager {
         if (frame != hot_frame) {
             hot_frame = frame;
             std::fill_n(heap.data() + size_t(Type::HotClean) * num_words, num_words, u64{0});
+            std::fill_n(heap.data() + size_t(Type::FlipFrame) * num_words, num_words, u64{0});
         }
         const u32 now = frame >> 7;
         if (now != hot_epoch) {
             hot_epoch = now;
             std::fill_n(heap.data() + size_t(Type::Hot) * num_words, num_words, u64{0});
             std::fill_n(heap.data() + size_t(Type::Flip) * num_words, num_words, u64{0});
+            hot_hashes.clear();
         }
     }
 
@@ -169,6 +183,7 @@ struct WordManager {
         std::span<u64> flip_words = Span(Type::Flip);
         std::span<u64> no_hot_words = Span(Type::NoHot);
         std::span<u64> hot_clean_words = Span(Type::HotClean);
+        std::span<u64> flip_frame_words = Span(Type::FlipFrame);
         std::span<u64> state_words = Span(type);
         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
@@ -183,6 +198,16 @@ struct WordManager {
                     // period makes a page hot, unless the GPU ever wrote it.
                     const u64 flipped = ~untracked_words[index] & mask;
                     if (flipped != 0) {
+                        // A page modified, uploaded and modified again within one frame is
+                        // rewritten for several uses per frame (Yoshi and the Mysterious Book's
+                        // GPU scene upload rings): uploading it once per frame would let a later
+                        // use read the bytes of an earlier one. It never becomes hot.
+                        if (HotIntraFrameCheck()) {
+                            const u64 again = flip_frame_words[index] & flipped;
+                            no_hot_words[index] |= again;
+                            hot_words[index] &= ~again;
+                            flip_frame_words[index] |= flipped;
+                        }
                         hot_words[index] |= flip_words[index] & flipped & ~no_hot_words[index];
                         flip_words[index] |= flipped;
                     }
@@ -251,7 +276,27 @@ struct WordManager {
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
             // Hot pages uploaded since the frame began are not modified again until the next frame.
-            const u64 hot_clean = hot_pages ? hot_words[index] & hot_clean_words[index] & mask : 0;
+            u64 hot_clean = hot_pages ? hot_words[index] & hot_clean_words[index] & mask : 0;
+            // A hot page is untracked, so a CPU write to it after this frame's upload goes unseen:
+            // compare it with the bytes uploaded. Changed, it is rewritten within the frame (for
+            // another use of the same buffer): upload it again and never let it be hot again.
+            if (hot_clean != 0 && HotIntraFrameCheck()) {
+                u64 changed = 0;
+                IteratePages(hot_clean, [&](size_t pages_offset, size_t pages_size) {
+                    for (size_t i = 0; i < pages_size; ++i) {
+                        const size_t page = index * PAGES_PER_WORD + pages_offset + i;
+                        if (HotPageHash(page) != HotPageStoredHash(page)) {
+                            changed |= u64{1} << (pages_offset + i);
+                        }
+                    }
+                });
+                if (changed != 0) {
+                    hot_clean &= ~changed;
+                    hot_clean_words[index] &= ~changed;
+                    hot_words[index] &= ~changed;
+                    Span(Type::NoHot)[index] |= changed;
+                }
+            }
             const u64 word = state_words[index] & mask & ~hot_clean;
             // Only hot pages retain CPU/Untracked bits after a CPU upload walk.
             if (upload_clean != nullptr && hot_pages &&
@@ -268,6 +313,14 @@ struct WordManager {
                 // with no write protection to set and no write fault to take.
                 const u64 hot = hot_pages ? hot_words[index] & mask : 0;
                 hot_clean_words[index] |= hot & word;
+                if (HotIntraFrameCheck() && (hot & word) != 0) {
+                    IteratePages(hot & word, [&](size_t pages_offset, size_t pages_size) {
+                        for (size_t i = 0; i < pages_size; ++i) {
+                            const size_t page = index * PAGES_PER_WORD + pages_offset + i;
+                            hot_hashes[static_cast<u32>(page)] = HotPageHash(page);
+                        }
+                    });
+                }
                 const u64 clear_mask = mask & ~hot;
                 if (type == Type::CPU || type == Type::CachedCPU) {
                     CollectChangedRanges(true, index, untracked_words[index], clear_mask, ranges);
@@ -476,6 +529,20 @@ struct WordManager {
     }
 
     std::array<u64, size_t(Type::Max) * num_words> heap = {};
+    /// Hash of each hot page's guest bytes at its last upload (HotIntraFrameCheck).
+    std::unordered_map<u32, u64> hot_hashes;
+
+    [[nodiscard]] u64 HotPageHash(size_t page) const {
+        const u8* const pointer =
+            tracker->template GetPointer<u8>(cpu_addr + page * BYTES_PER_PAGE);
+        return pointer != nullptr
+                   ? Common::CityHash64(reinterpret_cast<const char*>(pointer), BYTES_PER_PAGE)
+                   : 0;
+    }
+    [[nodiscard]] u64 HotPageStoredHash(size_t page) const {
+        const auto it = hot_hashes.find(static_cast<u32>(page));
+        return it != hot_hashes.end() ? it->second : ~u64{0};
+    }
     /// Bit per word, set while the word has no CPU and no Untracked page (DirtyWords). Every
     /// change to those words updates it: a per-word form of PR #161's upload_words count.
     u64 clean_words = 0;
