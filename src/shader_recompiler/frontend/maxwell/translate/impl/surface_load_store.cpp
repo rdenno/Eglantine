@@ -170,6 +170,77 @@ IR::Value MakeColor(TranslatorVisitor& v, IR::Reg reg, int num_regs) {
     }
     return ir.CompositeConstruct(colors[0], colors[1], colors[2], colors[3]);
 }
+
+// Bytes per texel of the formats a byte-addressed (.BA) surface store can target; 0 for the rest.
+u32 TexelBytes(TexturePixelFormat format) {
+    switch (format) {
+    case TexturePixelFormat::R8_UNORM:
+    case TexturePixelFormat::R8_SNORM:
+    case TexturePixelFormat::R8_SINT:
+    case TexturePixelFormat::R8_UINT:
+        return 1;
+    case TexturePixelFormat::R16_FLOAT:
+    case TexturePixelFormat::R16_UNORM:
+    case TexturePixelFormat::R16_SNORM:
+    case TexturePixelFormat::R16_UINT:
+    case TexturePixelFormat::R16_SINT:
+    case TexturePixelFormat::R8G8_UNORM:
+    case TexturePixelFormat::R8G8_SNORM:
+    case TexturePixelFormat::R8G8_SINT:
+    case TexturePixelFormat::R8G8_UINT:
+        return 2;
+    case TexturePixelFormat::A8B8G8R8_UNORM:
+    case TexturePixelFormat::A8B8G8R8_SNORM:
+    case TexturePixelFormat::A8B8G8R8_SINT:
+    case TexturePixelFormat::A8B8G8R8_UINT:
+    case TexturePixelFormat::A2B10G10R10_UNORM:
+    case TexturePixelFormat::A2B10G10R10_UINT:
+    case TexturePixelFormat::B10G11R11_FLOAT:
+    case TexturePixelFormat::R32_FLOAT:
+    case TexturePixelFormat::R32_UINT:
+    case TexturePixelFormat::R32_SINT:
+    case TexturePixelFormat::R16G16_UNORM:
+    case TexturePixelFormat::R16G16_FLOAT:
+    case TexturePixelFormat::R16G16_UINT:
+    case TexturePixelFormat::R16G16_SINT:
+    case TexturePixelFormat::R16G16_SNORM:
+        return 4;
+    case TexturePixelFormat::R16G16B16A16_FLOAT:
+    case TexturePixelFormat::R16G16B16A16_UNORM:
+    case TexturePixelFormat::R16G16B16A16_SNORM:
+    case TexturePixelFormat::R16G16B16A16_SINT:
+    case TexturePixelFormat::R16G16B16A16_UINT:
+    case TexturePixelFormat::R32G32_FLOAT:
+    case TexturePixelFormat::R32G32_SINT:
+    case TexturePixelFormat::R32G32_UINT:
+        return 8;
+    case TexturePixelFormat::R32G32B32A32_UINT:
+    case TexturePixelFormat::R32G32B32A32_FLOAT:
+    case TexturePixelFormat::R32G32B32A32_SINT:
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+u32 StoreBytes(Size size) {
+    switch (size) {
+    case Size::U8:
+    case Size::S8:
+        return 1;
+    case Size::U16:
+    case Size::S16:
+        return 2;
+    case Size::B32:
+        return 4;
+    case Size::B64:
+        return 8;
+    case Size::B128:
+        return 16;
+    }
+    throw NotImplementedException("Invalid size {}", size);
+}
+
 } // Anonymous namespace
 
 void TranslatorVisitor::SULD(u64 insn) {
@@ -257,7 +328,65 @@ void TranslatorVisitor::SUST(u64 insn) {
     }
     const bool is_typed{sust.d != 0};
     if (is_typed && sust.ba != 0) {
-        throw NotImplementedException("BA");
+        // .BA: x is a byte offset into the row. Split the store into whole texels of the bound
+        // surface, read from its descriptor (Yoshi and the Mysterious Book stores 32 bits as two
+        // R16 texels at x = 4 * i).
+        if (sust.is_bound == 0) {
+            throw NotImplementedException("BA with a bindless surface");
+        }
+        const u32 bound_handle{static_cast<u32>(sust.bound_offset * 4)};
+        const u32 raw_handle{env.ReadCbufValue(env.TextureBoundBuffer(), bound_handle)};
+        const u32 texel{TexelBytes(env.ReadTexturePixelFormat(raw_handle))};
+        const u32 store{StoreBytes(sust.size)};
+        if (texel == 0 || texel > store || store % texel != 0) {
+            throw NotImplementedException("BA store of {} bytes over {}-byte texels", store, texel);
+        }
+        const IR::U32 handle{ir.Imm32(bound_handle)};
+        const IR::Reg coord_reg{sust.coord_reg};
+        const IR::U32 x{IR::U32{ir.ShiftRightLogical(X(coord_reg), ir.Imm32(std::countr_zero(texel)))}};
+        const auto coords_at = [&](const IR::U32& column) -> IR::Value {
+            const auto array{[&](int index) {
+                return ir.BitFieldExtract(X(coord_reg + index), ir.Imm32(0), ir.Imm32(16));
+            }};
+            switch (sust.type) {
+            case Type::_1D:
+            case Type::BUFFER_1D:
+                return column;
+            case Type::ARRAY_1D:
+                return ir.CompositeConstruct(column, array(1));
+            case Type::_2D:
+                return ir.CompositeConstruct(column, X(coord_reg + 1));
+            case Type::ARRAY_2D:
+                return ir.CompositeConstruct(column, X(coord_reg + 1), array(2));
+            case Type::_3D:
+                return ir.CompositeConstruct(column, X(coord_reg + 1), X(coord_reg + 2));
+            }
+            throw NotImplementedException("Invalid type {}", sust.type.Value());
+        };
+        IR::TextureInstInfo info{};
+        info.type.Assign(GetType(sust.type));
+        const IR::U32 zero{ir.Imm32(0)};
+        for (u32 i = 0; i < store / texel; ++i) {
+            const IR::U32 column{i == 0 ? x : IR::U32{ir.IAdd(x, ir.Imm32(i))}};
+            IR::Value color;
+            if (texel < 4) {
+                // Bytes or halves of the data registers, lowest address first.
+                const u32 per_register{4 / texel};
+                const IR::U32 value{ir.BitFieldExtract(
+                    X(sust.data_reg + static_cast<int>(i / per_register)),
+                    ir.Imm32((i % per_register) * texel * 8), ir.Imm32(texel * 8))};
+                info.image_format.Assign(texel == 1 ? ImageFormat::R8_UINT : ImageFormat::R16_UINT);
+                color = ir.CompositeConstruct(value, zero, zero, zero);
+            } else {
+                const int regs{static_cast<int>(texel / 4)};
+                info.image_format.Assign(texel == 4   ? ImageFormat::R32_UINT
+                                         : texel == 8 ? ImageFormat::R32G32_UINT
+                                                      : ImageFormat::R32G32B32A32_UINT);
+                color = MakeColor(*this, sust.data_reg + static_cast<int>(i) * regs, regs);
+            }
+            ir.ImageWrite(handle, coords_at(column), color, info);
+        }
+        return;
     }
     const ImageFormat format{is_typed ? Format(sust.size) : ImageFormat::Typeless};
     const TextureType type{GetType(sust.type)};
