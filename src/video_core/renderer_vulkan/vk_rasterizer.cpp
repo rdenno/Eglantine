@@ -3281,7 +3281,6 @@ bool RasterizerVulkan::FrameDumpDrawInputs(bool is_indexed, std::span<const u64>
             if (slot < 0 && !is_indexed) {
                 return;
             }
-            constexpr u32 BUFFER_CAP = 4U << 20;
             const u32 size = (std::min)(binding.size, BUFFER_CAP);
             FrameDump::VertexInput& input = inputs.emplace_back(FrameDump::VertexInput{
                 .slot = slot,
