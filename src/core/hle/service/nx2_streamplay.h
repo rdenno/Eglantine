@@ -44,19 +44,19 @@ private:
         LOG_WARNING(Service, "(STUBBED) stpl:u::0 {}, returning {:#x} bytes of HID shared memory",
                     ctx.GetCommand(), HidSharedMemorySize);
         if (hid_memory == nullptr) {
-            auto& kernel = system.Kernel();
-            auto* const memory = Kernel::KSharedMemory::Create(kernel);
+            auto& kernel_ref = system.Kernel();
+            auto* const memory = Kernel::KSharedMemory::Create(kernel_ref);
             if (const Result result = memory->Initialize(
-                    kernel, system.DeviceMemory(), nullptr, Kernel::Svc::MemoryPermission::None,
+                    kernel_ref, system.DeviceMemory(), nullptr, Kernel::Svc::MemoryPermission::None,
                     Kernel::Svc::MemoryPermission::Read, HidSharedMemorySize);
                 result.IsError()) {
                 LOG_ERROR(Service, "Failed to make the stpl:u HID shared memory: {:#x}", result.raw);
-                memory->Close(kernel);
+                memory->Close(kernel_ref);
                 IPC::ResponseBuilder rb{ctx, 2};
                 rb.Push(result);
                 return;
             }
-            Kernel::KSharedMemory::Register(kernel, memory);
+            Kernel::KSharedMemory::Register(kernel_ref, memory);
             std::memset(memory->GetPointer(), 0, HidSharedMemorySize);
             hid_memory = memory;
         }
